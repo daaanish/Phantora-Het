@@ -442,6 +442,35 @@ pub extern "C" fn cuda_add_latency(device: i32, stream: i32, latency: i64) {
     ));
 }
 
+/// Caller supplies `len` readable bytes. Semantic validation lives on the server.
+#[no_mangle]
+pub unsafe extern "C" fn cuda_gdn_call(
+    device: i32, stream: i32, payload: *const u8, len: usize,
+) -> i32 {
+    if payload.is_null() || len == 0 || len > 32768 || device < 0 || stream < 0 {
+        return -1;
+    }
+    let bytes = std::slice::from_raw_parts(payload, len);
+    let Ok(key_json) = std::str::from_utf8(bytes) else { return -1; };
+    let key_json = key_json.to_owned();
+    match std::panic::catch_unwind(|| {
+        send_cuda_call(CudaCall::GdnCall { stream: CudaStream { device, id: stream }, key_json });
+    }) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn cuda_coverage_control(payload: *const u8, len: usize) -> i32 {
+    if payload.is_null() || len == 0 || len > 32768 { return -1; }
+    let Ok(payload) = std::str::from_utf8(std::slice::from_raw_parts(payload, len)) else { return -1; };
+    let payload = payload.to_owned();
+    match std::panic::catch_unwind(|| send_cuda_call(CudaCall::CoverageControl { payload })) {
+        Ok(()) => 0, Err(_) => -1,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cuda_stream_query(device: i32, stream: i32) -> i32 {
     // See cuda_event_query: non-blocking poll, truthful status, poll cost charged

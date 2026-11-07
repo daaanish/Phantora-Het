@@ -214,6 +214,7 @@ struct CCWaiting {
 pub struct Simulator {
     cuda_estimator: CudaEstimator,
     torch_estimator: TorchEstimator,
+    gdn_estimator: crate::gdn::GdnEstimator,
 
     queue: EventQueue,
     stream_info: HashMap<(HostId, CudaStream), StreamInfo>,
@@ -346,10 +347,20 @@ impl Simulator {
     }
 
     pub fn new(netsim: netsim::simulator::Simulator) -> Self {
-        let (cuda_estimator, torch_estimator) = Self::build_estimators();
+        let (mut cuda_estimator, mut torch_estimator) = Self::build_estimators();
+        let options = args::get_args();
+        if options.coverage_mode.is_some() {
+            cuda_estimator.discard_zero_measurements();
+            torch_estimator.discard_zero_measurements();
+        }
+        let gdn_db = options.perf_db.as_ref().or(options.record_perf_db.as_ref())
+            .filter(|dir| dir.join("gdn.csv").is_file())
+            .map(|dir| PerfDb::load(dir).expect("fused timing DB was already validated").gdn)
+            .unwrap_or_default();
         Simulator {
             cuda_estimator,
             torch_estimator,
+            gdn_estimator: crate::gdn::GdnEstimator { db: gdn_db, ..Default::default() },
 
             queue: EventQueue::new(netsim),
             stream_info: HashMap::new(),
@@ -577,6 +588,7 @@ impl Simulator {
         }
 
         match msg.call {
+            CudaCall::CoverageControl { .. } => (),
             CudaCall::CudaMemcpyAsync { size, kind, stream } => {
                 self.cuda_memcpy_async(host, curr_time, size, kind, stream, call)
             }
@@ -599,6 +611,20 @@ impl Simulator {
             }
             CudaCall::CudaAddLatency(stream, latency) => {
                 self.cuda_add_latency(host, curr_time, stream, latency, call);
+            }
+            CudaCall::GdnCall { stream, key_json } => {
+                let duration = if stream.device < 0 || stream.id < 0 {
+                    self.gdn_estimator.invalid.insert("invalid fused stream identity".into());
+                    eprintln!("INVALID fused event: invalid stream identity");
+                    Duration::ZERO
+                } else { self.gdn_estimator.estimate(&key_json) };
+                // add_event flushes preceding Torch work and chains this stream.
+                Self::add_event(
+                    &mut self.torch_estimator, &mut self.stream_info, &mut self.queue,
+                    (host.host.clone(), stream), vec![],
+                    Some(Action::Computation(NodeId(host.host), duration.as_micros() as i64,
+                        ComputeMeta::Cuda(call))), curr_time,
+                );
             }
 
             CudaCall::FlashAttnCall {
@@ -1691,6 +1717,16 @@ impl Simulator {
             .push((call, comp_dur));
     }
 
+    pub fn coverage_misses(&self) -> std::collections::BTreeMap<String, usize> {
+        std::collections::BTreeMap::from([
+            ("compute".into(), self.torch_estimator.missing().len()),
+            ("memcpy".into(), self.cuda_estimator.missing_memcpy().len()),
+            ("flash_attn".into(), self.cuda_estimator.missing_flash().len()),
+            ("gdn".into(), self.gdn_estimator.missing.len()),
+            ("malformed_gdn".into(), self.gdn_estimator.invalid.len()),
+        ])
+    }
+
     pub fn handle_exit(&mut self, host: ResponseId, curr_time: i64) {
         log::debug!("{:?} exited at {}", host, curr_time);
         self.exited_hosts.insert(host.host, curr_time);
@@ -1702,6 +1738,7 @@ impl Simulator {
         if let Some(dir) = &args::get_args().record_perf_db {
             let db = PerfDb {
                 gpu_name: self.cuda_estimator.gpu_name(),
+                gdn: self.gdn_estimator.db.clone(),
                 compute: self.torch_estimator.compute_cache().clone(),
                 sequence: self.torch_estimator.sequence_cache().clone(),
                 memcpy: self.cuda_estimator.memcpy_cache().clone(),
@@ -1746,11 +1783,13 @@ impl Simulator {
                 .iter()
                 .map(|k| (k.clone(), Duration::ZERO))
                 .collect();
-            if compute.is_empty() && memcpy.is_empty() && flash_attn.is_empty() {
+            if compute.is_empty() && memcpy.is_empty() && flash_attn.is_empty()
+                && self.gdn_estimator.missing.is_empty() && self.gdn_estimator.invalid.is_empty() {
                 let _ = std::fs::remove_dir_all(&missing_path);
             } else {
                 let db = PerfDb {
                     gpu_name: String::new(),
+                    gdn: Default::default(),
                     compute,
                     sequence: Default::default(),
                     memcpy,
@@ -1782,6 +1821,17 @@ impl Simulator {
                     ),
                 }
             }
+        }
+        if !self.gdn_estimator.missing.is_empty() || !self.gdn_estimator.invalid.is_empty() {
+            let options = args::get_args();
+            let base = options.perf_db.as_ref().or(options.record_perf_db.as_ref());
+            let path = base.map(|dir| std::path::PathBuf::from(format!("{}.missing", dir.display())))
+                .unwrap_or_else(|| std::path::PathBuf::from("gdn.missing"));
+            if let Err(error) = self.gdn_estimator.write_discovery(&path) {
+                eprintln!("INVALID: unable to save fused discovery: {error}");
+            }
+            eprintln!("INVALID simulation: {} fused timing misses / {} malformed semantic event kinds; see {}",
+                self.gdn_estimator.missing.len(), self.gdn_estimator.invalid.len(), path.display());
         }
     }
 }

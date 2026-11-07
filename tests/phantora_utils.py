@@ -2,10 +2,14 @@ import ctypes
 import os
 import time as _time
 import torch
-from torch.profiler import (
-    enable_function_tracer as _enable_function_tracer,
-    disable_function_tracer as _disable_function_tracer,
-)
+if os.environ.get("PHANTORA") is not None:
+    try:
+        from torch.profiler import (
+            enable_function_tracer as _enable_function_tracer,
+            disable_function_tracer as _disable_function_tracer,
+        )
+    except ImportError as exc:
+        raise RuntimeError("PHANTORA requires the patched PyTorch function tracer") from exc
 import torch.nn.parameter
 from torch.utils.data import Dataset
 

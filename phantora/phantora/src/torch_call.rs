@@ -92,7 +92,10 @@ impl TorchValueJson {
             TorchValueJson::Int { value } => TorchValue::Int(value),
             TorchValueJson::Bool { value } => TorchValue::Bool(value),
             TorchValueJson::String { value } => TorchValue::String(value),
-            TorchValueJson::Device { value } => TorchValue::Device(parse_device(value)),
+            TorchValueJson::Device { value } => {
+                if value == "cuda" { TorchValue::CurrentCudaDevice }
+                else { TorchValue::Device(parse_device(value)) }
+            }
         }
     }
 }
@@ -131,6 +134,19 @@ impl TorchCallMsg {
     pub fn gpu_index(&self) -> Option<usize> {
         self.args.iter().find_map(TorchValue::gpu_index)
     }
+
+    pub fn cuda_argument_index(&self) -> Option<usize> {
+        fn find(value: &TorchValue, current: usize) -> Option<usize> {
+            match value {
+                TorchValue::CurrentCudaDevice => Some(current),
+                TorchValue::Device(tch::Device::Cuda(device)) => Some(*device),
+                TorchValue::List(values) | TorchValue::Tuple(values) => values.iter().find_map(|value| find(value, current)),
+                _ => value.gpu_index(),
+            }
+        }
+        let current = self.stream.map(|(device, _)| device.max(0) as usize).unwrap_or(0);
+        self.args.iter().find_map(|value| find(value, current))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -143,6 +159,7 @@ pub enum TorchValue {
     Bool(bool),
     String(String),
     Device(tch::Device),
+    CurrentCudaDevice,
 }
 
 impl TorchValue {
@@ -173,8 +190,86 @@ fn maybe_tensor_list(value: &[TorchValue]) -> Option<Vec<TensorInfo>> {
         .collect()
 }
 
+fn qwen_call(op: &str, args: &[TorchValue]) -> Option<TorchCallInfo> {
+    use TorchValue::*;
+    fn scalar(value: &TorchValue) -> Option<u64> {
+        let number = match value { Int(v) => *v as f64, Double(v) => *v, _ => return None };
+        number.is_finite().then_some(number.to_bits())
+    }
+    let mut inputs = Vec::new();
+    let mut scalars = Vec::new();
+    let mut dims = Vec::new();
+    let mut keepdim = false;
+    let mut dtype = None;
+    let tensor = |value: &TorchValue| match value {
+        Tensor(shape, kind, _) => Some(TensorInfo { shape: shape.clone(), dtype: *kind }), _ => None,
+    };
+    match (op, args) {
+        ("exp" | "neg" | "sigmoid" | "silu" | "rsqrt", [x]) => inputs.push(tensor(x)?),
+        ("sigmoid_backward" | "silu_backward", [grad, x]) => {
+            inputs.extend([tensor(grad)?, tensor(x)?]);
+        }
+        ("pow", [x @ Tensor(..), exponent]) => {
+            let input = tensor(x)?;
+            let exponent = scalar(exponent)?;
+            if f64::from_bits(exponent) == 2.0 { return Some(TorchCallInfo::Pow(input)); }
+            inputs.push(input);
+            scalars.push(exponent);
+        }
+        ("div_", [x, other @ Tensor(..)]) => inputs.extend([tensor(x)?, tensor(other)?]),
+        ("div_", [x, other]) => { inputs.push(tensor(x)?); scalars.push(scalar(other)?); }
+        ("to", [x, Int(kind), Bool(_), Bool(copy)]) => {
+            if *copy { return None; }
+            return Some(TorchCallInfo::ConvDType(tensor(x)?, tch::Kind::from_c_int(*kind as i32).ok()?));
+        }
+        ("softplus", [x]) => { inputs.push(tensor(x)?); scalars.extend([1f64.to_bits(), 20f64.to_bits()]); }
+        ("softplus", [x, beta, threshold]) => {
+            inputs.push(tensor(x)?); scalars.extend([scalar(beta)?, scalar(threshold)?]);
+        }
+        ("softplus_backward", [grad, x, beta, threshold]) => {
+            inputs.extend([tensor(grad)?, tensor(x)?]); scalars.extend([scalar(beta)?, scalar(threshold)?]);
+        }
+        ("mean" | "sum", [x, tail @ ..]) => {
+            let input = tensor(x)?;
+            match tail {
+                [] => { if op == "sum" { return Some(TorchCallInfo::Sum(input)); } }
+                [List(values), Bool(keep), rest @ ..] => {
+                    for value in values { if let Int(dim) = value { dims.push(*dim); } else { return None; } }
+                    keepdim = *keep;
+                    match rest { [] => (), [Int(kind)] => dtype = Some(tch::Kind::from_c_int(*kind as i32).ok()?), _ => return None }
+                }
+                [Int(dim), Bool(keep)] => { dims.push(*dim); keepdim = *keep; }
+                [Int(kind)] => dtype = Some(tch::Kind::from_c_int(*kind as i32).ok()?),
+                _ => return None,
+            }
+            let rank = input.shape.len() as i64;
+            for dim in &mut dims {
+                if *dim < 0 { *dim += rank; }
+                if *dim < 0 || *dim >= rank { return None; }
+            }
+            dims.sort_unstable();
+            if dims.windows(2).any(|pair| pair[0] == pair[1]) { return None; }
+            inputs.push(input);
+        }
+        _ => return None,
+    }
+    Some(TorchCallInfo::QwenOp { op: op.into(), inputs, scalars, dims, keepdim, dtype })
+}
+
 impl TorchCallMsg {
     pub fn into_call(self, arg_device: i32) -> Option<TorchCall> {
+        self.into_call_mode(arg_device, false).0
+    }
+
+    pub fn into_hybrid_call(self, arg_device: i32) -> Option<TorchCall> {
+        self.into_call_mode(arg_device, true).0
+    }
+
+    pub fn into_hybrid_classified_call(self, arg_device: i32) -> (Option<TorchCall>, bool) {
+        self.into_call_mode(arg_device, true)
+    }
+
+    fn into_call_mode(self, arg_device: i32, hybrid: bool) -> (Option<TorchCall>, bool) {
         let stream = match self.stream {
             Some((device, id)) => CudaStream { device, id },
             None => CudaStream {
@@ -184,6 +279,7 @@ impl TorchCallMsg {
         };
 
         use TorchValue::*;
+        let mut recognized = true;
         let call_info = match self.name.as_ref() {
             "aten::mm" => match self.args.as_slice() {
                 [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _)] => Some(TorchCallInfo::MM(
@@ -433,18 +529,18 @@ impl TorchCallMsg {
                     None
                 }
             },
+            "aten::pow" if hybrid => qwen_call("pow", &self.args),
             "aten::pow" => match self.args.as_slice() {
-                [Tensor(shape, kind, _), _] | [_, Tensor(shape, kind, _)] => {
-                    Some(TorchCallInfo::Pow(TensorInfo {
-                        shape: shape.clone(),
-                        dtype: *kind,
-                    }))
-                }
-                _ => {
-                    log::warn!("{} args not match: {:?}", self.name, self.args);
-                    None
-                }
+                [Tensor(shape, kind, _), _] | [_, Tensor(shape, kind, _)] => Some(TorchCallInfo::Pow(TensorInfo {
+                    shape: shape.clone(), dtype: *kind,
+                })),
+                _ => None,
             },
+            "aten::exp" | "aten::neg" | "aten::div_" | "aten::sigmoid" | "aten::silu" | "aten::rsqrt"
+            | "aten::softplus" | "aten::mean" | "aten::sigmoid_backward"
+            | "aten::silu_backward" | "aten::softplus_backward" if hybrid => {
+                qwen_call(self.name.trim_start_matches("aten::"), &self.args)
+            }
             "aten::addcmul_" => match self.args.as_slice() {
                 [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), ..] => {
                     Some(TorchCallInfo::AddCMul_(
@@ -707,15 +803,12 @@ impl TorchCallMsg {
                     None
                 }
             },
+            "aten::sum" if hybrid => qwen_call("sum", &self.args),
             "aten::sum" => match self.args.as_slice() {
                 [Tensor(shape, kind, _), ..] => Some(TorchCallInfo::Sum(TensorInfo {
-                    shape: shape.clone(),
-                    dtype: *kind,
+                    shape: shape.clone(), dtype: *kind,
                 })),
-                _ => {
-                    log::warn!("{} args not match: {:?}", self.name, self.args);
-                    None
-                }
+                _ => None,
             },
             "aten::softmax" => match self.args.as_slice() {
                 [Tensor(shape, kind, _), Int(dim), ..] => Some(TorchCallInfo::Softmax(
@@ -759,6 +852,7 @@ impl TorchCallMsg {
                     None
                 }
             },
+            "aten::to" if hybrid => qwen_call("to", &self.args),
             "aten::to" => match self.args.as_slice() {
                 [Tensor(shape, kind, _), Int(dtype_idx), Bool(_), Bool(_)] => {
                     Some(TorchCallInfo::ConvDType(
@@ -998,9 +1092,9 @@ impl TorchCallMsg {
                 }
                 _ => None,
             },
-            _ => None,
+            _ => { recognized = false; None },
         };
-        call_info.map(|info| TorchCall {
+        (call_info.map(|info| TorchCall {
             time: self.curr_time,
             id: ResponseId {
                 host: HostId {
@@ -1011,7 +1105,7 @@ impl TorchCallMsg {
             },
             stream,
             info,
-        })
+        }), recognized)
     }
 }
 
@@ -1108,6 +1202,10 @@ pub enum TorchCallInfo {
         stride: [i64; 2],
         padding: [i64; 2],
     },
+    QwenOp {
+        op: String, inputs: Vec<TensorInfo>, scalars: Vec<u64>, dims: Vec<i64>,
+        keepdim: bool, dtype: Option<tch::Kind>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1116,4 +1214,45 @@ pub struct TorchCall {
     pub id: ResponseId,
     pub stream: CudaStream,
     pub info: TorchCallInfo,
+}
+
+#[cfg(test)]
+mod hybrid_tests {
+    use super::*;
+
+    fn tensor() -> TorchValue { TorchValue::Tensor(vec![2, 3], tch::Kind::Float, tch::Device::Cuda(0)) }
+    fn message(name: &str, args: Vec<TorchValue>) -> TorchCallMsg {
+        TorchCallMsg { pid: 1, tid: 1, hostname: "host".into(), stream: Some((0, 0)), curr_time: 0, name: name.into(), args }
+    }
+
+    #[test]
+    fn qwen_mappings_are_opt_in_and_power_two_retains_legacy_key() {
+        assert!(message("aten::silu", vec![tensor()]).into_call(0).is_none());
+        assert!(matches!(message("aten::silu", vec![tensor()]).into_hybrid_call(0).unwrap().info,
+            TorchCallInfo::QwenOp { op, .. } if op == "silu"));
+        for exponent in [2, 3] {
+            assert!(matches!(message("aten::pow", vec![tensor(), TorchValue::Int(exponent)]).into_call(0).unwrap().info,
+                TorchCallInfo::Pow(_)));
+        }
+        assert!(matches!(message("aten::pow", vec![tensor(), TorchValue::Int(2)]).into_hybrid_call(0).unwrap().info,
+            TorchCallInfo::Pow(_)));
+        assert!(matches!(message("aten::pow", vec![tensor(), TorchValue::Int(3)]).into_hybrid_call(0).unwrap().info,
+            TorchCallInfo::QwenOp { scalars, .. } if scalars == vec![3f64.to_bits()]));
+    }
+
+    #[test]
+    fn hybrid_reductions_keep_dimensions_and_device_only_calls_are_visible() {
+        let args = || vec![tensor(), TorchValue::List(vec![TorchValue::Int(-1)]), TorchValue::Bool(true)];
+        assert!(matches!(message("aten::sum", args()).into_call(0).unwrap().info, TorchCallInfo::Sum(_)));
+        assert!(matches!(message("aten::sum", args()).into_hybrid_call(0).unwrap().info,
+            TorchCallInfo::QwenOp { dims, keepdim: true, .. } if dims == vec![1]));
+        let creation = message("aten::zeros", vec![TorchValue::Device(tch::Device::Cuda(2))]);
+        assert_eq!(creation.gpu_index(), None);
+        assert_eq!(creation.cuda_argument_index(), Some(2));
+        let mut current = message("aten::zeros", vec![TorchValue::CurrentCudaDevice]);
+        current.stream = Some((3, 7));
+        assert_eq!(current.gpu_index(), None);
+        assert_eq!(current.cuda_argument_index(), Some(3));
+        assert!(message("aten::silu", vec![TorchValue::Int(1)]).into_hybrid_call(0).is_none());
+    }
 }

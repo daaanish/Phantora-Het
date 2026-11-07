@@ -304,6 +304,13 @@ impl CudaEstimator {
         &self.memcpy_cache
     }
 
+    /// Opt-in replay discovery; zero-byte/host-only transfers have no GPU work.
+    pub fn discard_zero_measurements(&mut self) {
+        self.memcpy_cache.retain(|(kind, size), duration| !duration.is_zero()
+            || *size == 0 || *kind == CudaMemcpyKind::HostToHost);
+        self.flash_attn_cache.retain(|_, duration| !duration.is_zero());
+    }
+
     pub fn flash_attn_cache(&self) -> &HashMap<FlashAttnKey, Duration> {
         &self.flash_attn_cache
     }
@@ -559,5 +566,24 @@ impl CudaEstimator {
         });
         self.flash_attn_cache.insert(key, dur);
         dur
+    }
+}
+
+#[cfg(test)]
+mod hybrid_zero_tests {
+    use super::*;
+
+    #[test]
+    fn zero_transfers_are_rediscovered_but_explicit_noops_remain_valid() {
+        let copy = (CudaMemcpyKind::DeviceToDevice, 4096);
+        let empty = (CudaMemcpyKind::DeviceToDevice, 0);
+        let mut estimator = CudaEstimator::new_replay(HashMap::from([
+            (copy, Duration::ZERO), (empty, Duration::ZERO),
+        ]), HashMap::new());
+        estimator.discard_zero_measurements();
+        estimator.memcpy(empty.0, empty.1);
+        assert!(estimator.missing_memcpy().is_empty());
+        estimator.memcpy(copy.0, copy.1);
+        assert_eq!(estimator.missing_memcpy(), &[copy]);
     }
 }

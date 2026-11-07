@@ -205,6 +205,8 @@ pub enum CudaCall {
     },
 
     ReadTimer(CudaStream),
+    GdnCall { stream: CudaStream, key_json: String },
+    CoverageControl { payload: String },
 }
 
 impl CudaCall {
@@ -222,7 +224,7 @@ impl CudaCall {
     pub fn get_cuda_stream(&self) -> Option<CudaStream> {
         use CudaCall::*;
         match self {
-            CudaMemcpyAsync { stream, .. } => Some(*stream),
+            CudaMemcpyAsync { stream, .. } | GdnCall { stream, .. } => Some(*stream),
             CudaStreamSynchronize(stream) => Some(*stream),
             CudaStreamWaitEvent { stream, .. } => Some(*stream),
             CudaEventRecord(event) | CudaEventSynchronize(event) | CudaEventQuery(event) => {
@@ -274,3 +276,28 @@ pub struct SplitResponse {
 }
 
 pub mod capi;
+
+#[cfg(test)]
+mod gdn_tests {
+    use super::*;
+
+    #[test]
+    fn semantic_event_wire_round_trip() {
+        let event = CudaCall::GdnCall {
+            stream: CudaStream { device: 2, id: 7 }, key_json: "{}".into(),
+        };
+        let bytes = bincode::serialize(&event).unwrap();
+        assert_eq!(bincode::deserialize::<CudaCall>(&bytes).unwrap(), event);
+        assert_eq!(event.get_cuda_stream(), Some(CudaStream { device: 2, id: 7 }));
+    }
+
+    #[test]
+    fn semantic_ffi_rejects_invalid_transport_without_sending() {
+        unsafe {
+            assert_eq!(capi::cuda_gdn_call(0, 0, std::ptr::null(), 1), -1);
+            assert_eq!(capi::cuda_gdn_call(-1, 0, b"{}".as_ptr(), 2), -1);
+            assert_eq!(capi::cuda_gdn_call(0, 0, b"{}".as_ptr(), 32769), -1);
+            assert_eq!(capi::cuda_gdn_call(0, 0, [255u8].as_ptr(), 1), -1);
+        }
+    }
+}

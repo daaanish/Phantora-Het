@@ -49,6 +49,7 @@ pub struct FlashAttnKey {
 #[derive(Default)]
 pub struct PerfDb {
     pub gpu_name: String,
+    pub gdn: crate::gdn::GdnDb,
     pub compute: HashMap<TorchCallInfo, Duration>,
     pub sequence: BTreeMap<u64, Vec<Duration>>,
     pub memcpy: HashMap<(CudaMemcpyKind, usize), Duration>,
@@ -297,12 +298,14 @@ impl PerfDb {
             }
         }
 
+        db.gdn = crate::gdn::GdnDb::load(dir, &db.gpu_name)?;
         Ok(db)
     }
 
     /// Write the DB to `dir` as CSV tables + a markdown manifest, creating `dir`.
     pub fn save(&self, dir: &Path) -> Result<(), Box<dyn Error>> {
         fs::create_dir_all(dir)?;
+        self.gdn.save(dir)?;
 
         // compute.csv (key = compacted TorchCallInfo JSON; see compact_value)
         {
@@ -434,6 +437,11 @@ impl PerfDb {
             self.flash_attn.len(),
         );
         fs::write(dir.join("manifest.md"), manifest)?;
+        if !self.gdn.entries.is_empty() {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new().append(true).open(dir.join("manifest.md"))?;
+            writeln!(file, "\nFused semantic timing entries: {} (`gdn.csv`, key schema 1). Each row includes validated implementation/GPU provenance.", self.gdn.entries.len())?;
+        }
 
         Ok(())
     }

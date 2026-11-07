@@ -20,6 +20,14 @@
 
 static _Thread_local int CURRENT_DEVICE = 0;
 
+// Python passes a runtime stream handle, never a simulator stream ID.
+int
+phantora_gdn_call(void* stream, const unsigned char* payload, size_t len)
+{
+    struct phantora_cudaStream translated = phantora_cudaStream(stream);
+    return cuda_gdn_call(translated.device, translated.id, payload, len);
+}
+
 static atomic_int STREAM_COUNTER = 1;
 static atomic_int EVENT_COUNTER = 0;
 

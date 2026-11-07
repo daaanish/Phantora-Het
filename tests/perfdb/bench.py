@@ -110,6 +110,11 @@ def is_ti(x):
 def build(op, payload):
     P = payload
     _ACACHE.clear()  # fresh per op; aliases same-(numel,dtype) operands within this op
+    if op == "QwenOp":
+        import runpy
+        from pathlib import Path
+        build_qwen_op = runpy.run_path(str(Path(__file__).resolve().parents[2] / "phantora/phantora/src/qwen_ops.py"))["build"]
+        return build_qwen_op(payload, allocator=alloc)
 
     def two():            # tuple of two TensorInfo
         return alloc(P[0]), alloc(P[1])

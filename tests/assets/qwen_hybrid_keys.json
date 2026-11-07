@@ -1,0 +1,371 @@
+[
+  {
+    "version": 1,
+    "op": "l2norm",
+    "direction": "forward",
+    "inputs": [
+      {
+        "shape": [
+          1,
+          2,
+          4
+        ],
+        "strides": [
+          8,
+          4,
+          1
+        ],
+        "dtype": "float32",
+        "requires_grad": true
+      }
+    ],
+    "grad_enabled": true,
+    "grad_output": null,
+    "options": {
+      "eps": "1e-06",
+      "output_dtype": "float32"
+    }
+  },
+  {
+    "version": 1,
+    "op": "l2norm",
+    "direction": "backward",
+    "inputs": [
+      {
+        "shape": [
+          1,
+          2,
+          4
+        ],
+        "strides": [
+          8,
+          4,
+          1
+        ],
+        "dtype": "float32",
+        "requires_grad": true
+      }
+    ],
+    "grad_enabled": true,
+    "grad_output": {
+      "shape": [
+        1,
+        2,
+        4
+      ],
+      "strides": [
+        0,
+        0,
+        0
+      ],
+      "dtype": "float32",
+      "requires_grad": false
+    },
+    "options": {
+      "eps": "1e-06",
+      "output_dtype": "float32"
+    }
+  },
+  {
+    "version": 1,
+    "op": "causal_conv1d",
+    "direction": "forward",
+    "inputs": [
+      {
+        "shape": [
+          1,
+          4,
+          8
+        ],
+        "strides": [
+          32,
+          1,
+          4
+        ],
+        "dtype": "float32",
+        "requires_grad": true
+      },
+      {
+        "shape": [
+          4,
+          3
+        ],
+        "strides": [
+          3,
+          1
+        ],
+        "dtype": "float32",
+        "requires_grad": true
+      },
+      {
+        "shape": [
+          4
+        ],
+        "strides": [
+          1
+        ],
+        "dtype": "float32",
+        "requires_grad": true
+      }
+    ],
+    "grad_enabled": true,
+    "grad_output": null,
+    "options": {
+      "activation": "silu"
+    }
+  },
+  {
+    "version": 1,
+    "op": "causal_conv1d",
+    "direction": "backward",
+    "inputs": [
+      {
+        "shape": [
+          1,
+          4,
+          8
+        ],
+        "strides": [
+          32,
+          1,
+          4
+        ],
+        "dtype": "float32",
+        "requires_grad": true
+      },
+      {
+        "shape": [
+          4,
+          3
+        ],
+        "strides": [
+          3,
+          1
+        ],
+        "dtype": "float32",
+        "requires_grad": true
+      },
+      {
+        "shape": [
+          4
+        ],
+        "strides": [
+          1
+        ],
+        "dtype": "float32",
+        "requires_grad": true
+      }
+    ],
+    "grad_enabled": true,
+    "grad_output": {
+      "shape": [
+        1,
+        4,
+        8
+      ],
+      "strides": [
+        0,
+        0,
+        0
+      ],
+      "dtype": "float32",
+      "requires_grad": false
+    },
+    "options": {
+      "activation": "silu"
+    }
+  },
+  {
+    "version": 1,
+    "op": "chunk_gated_delta_rule",
+    "direction": "forward",
+    "inputs": [
+      {
+        "shape": [
+          1,
+          8,
+          2,
+          4
+        ],
+        "strides": [
+          64,
+          8,
+          4,
+          1
+        ],
+        "dtype": "float32",
+        "requires_grad": true
+      },
+      {
+        "shape": [
+          1,
+          8,
+          2,
+          4
+        ],
+        "strides": [
+          64,
+          8,
+          4,
+          1
+        ],
+        "dtype": "float32",
+        "requires_grad": true
+      },
+      {
+        "shape": [
+          1,
+          8,
+          4,
+          6
+        ],
+        "strides": [
+          192,
+          24,
+          6,
+          1
+        ],
+        "dtype": "float32",
+        "requires_grad": true
+      },
+      {
+        "shape": [
+          1,
+          8,
+          4
+        ],
+        "strides": [
+          32,
+          4,
+          1
+        ],
+        "dtype": "float32",
+        "requires_grad": true
+      },
+      {
+        "shape": [
+          1,
+          8,
+          4
+        ],
+        "strides": [
+          32,
+          4,
+          1
+        ],
+        "dtype": "float32",
+        "requires_grad": true
+      }
+    ],
+    "grad_enabled": true,
+    "grad_output": null,
+    "options": {
+      "scale": "0.5",
+      "use_qk_l2norm_in_kernel": "false"
+    }
+  },
+  {
+    "version": 1,
+    "op": "chunk_gated_delta_rule",
+    "direction": "backward",
+    "inputs": [
+      {
+        "shape": [
+          1,
+          8,
+          2,
+          4
+        ],
+        "strides": [
+          64,
+          8,
+          4,
+          1
+        ],
+        "dtype": "float32",
+        "requires_grad": true
+      },
+      {
+        "shape": [
+          1,
+          8,
+          2,
+          4
+        ],
+        "strides": [
+          64,
+          8,
+          4,
+          1
+        ],
+        "dtype": "float32",
+        "requires_grad": true
+      },
+      {
+        "shape": [
+          1,
+          8,
+          4,
+          6
+        ],
+        "strides": [
+          192,
+          24,
+          6,
+          1
+        ],
+        "dtype": "float32",
+        "requires_grad": true
+      },
+      {
+        "shape": [
+          1,
+          8,
+          4
+        ],
+        "strides": [
+          32,
+          4,
+          1
+        ],
+        "dtype": "float32",
+        "requires_grad": true
+      },
+      {
+        "shape": [
+          1,
+          8,
+          4
+        ],
+        "strides": [
+          32,
+          4,
+          1
+        ],
+        "dtype": "float32",
+        "requires_grad": true
+      }
+    ],
+    "grad_enabled": true,
+    "grad_output": {
+      "shape": [
+        1,
+        8,
+        4,
+        6
+      ],
+      "strides": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "dtype": "float32",
+      "requires_grad": false
+    },
+    "options": {
+      "scale": "0.5",
+      "use_qk_l2norm_in_kernel": "false"
+    }
+  }
+]

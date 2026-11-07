@@ -43,6 +43,17 @@ pub struct Args {
     /// GPU as usual, then write/merge the timing tables (CSV) on exit.
     #[arg(long)]
     pub record_perf_db: Option<path::PathBuf>,
+    /// Opt-in hybrid run identity, manifest, and machine-readable status.
+    #[arg(long)]
+    pub run_id: Option<String>,
+    #[arg(long)]
+    pub expected_ranks: Option<u32>,
+    #[arg(long)]
+    pub coverage_plan: Option<path::PathBuf>,
+    #[arg(long)]
+    pub coverage_status: Option<path::PathBuf>,
+    #[arg(long, value_parser = ["strict", "discovery"])]
+    pub coverage_mode: Option<String>,
 }
 
 fn parse_cores(s: &str) -> Result<Vec<usize>, Box<dyn Error + Send + Sync>> {

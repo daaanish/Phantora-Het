@@ -93,6 +93,15 @@ impl TorchEstimator {
         &self.compute_cache
     }
 
+    /// Opt-in only: rediscover unmeasured loaded rows rather than accepting zero.
+    pub fn discard_zero_measurements(&mut self) {
+        self.compute_cache.retain(|call, duration| !duration.is_zero() || match call {
+            TorchCallInfo::Dropout(_, probability, training) => *probability == 0 || !*training,
+            TorchCallInfo::ConvDType(input, output) => input.dtype == *output,
+            _ => false,
+        });
+    }
+
     /// Compute keys requested during replay that were not in the DB (discovery).
     pub fn missing(&self) -> &[TorchCallInfo] {
         &self.missing
@@ -144,6 +153,17 @@ impl TorchEstimator {
 
     fn run(&mut self, niter: i32, call: &TorchCallInfo) -> Duration {
         match call {
+            TorchCallInfo::QwenOp { .. } => {
+                use pyo3::prelude::*;
+                Python::with_gil(|py| {
+                    let module = PyModule::from_code_bound(py,
+                        include_str!("qwen_ops.py"), "qwen_ops.py", "phantora_qwen_ops").unwrap();
+                    let thunk = module.getattr("build").unwrap()
+                        .call1((serde_json::to_string(call).unwrap(),)).unwrap();
+                    let (_, duration) = estimate!(niter, thunk.call0().unwrap());
+                    duration
+                })
+            }
             TorchCallInfo::MM(info1, info2) => {
                 let t1 = self.allocate(info1);
                 let t2 = self.allocate(info2);
@@ -623,5 +643,33 @@ impl TorchEstimator {
         }
         self.sequence_cache.insert(seq_hash, durs.clone());
         durs
+    }
+}
+
+#[cfg(test)]
+mod hybrid_zero_tests {
+    use super::*;
+
+    #[test]
+    fn zero_loaded_compute_is_rediscovered_only_in_opt_in_mode() {
+        let input = TensorInfo { shape: vec![2, 3], dtype: Kind::Float };
+        let key = TorchCallInfo::Pow(input.clone());
+        let cache = HashMap::from([(key.clone(), Duration::ZERO)]);
+        let mut legacy = TorchEstimator::new_replay(cache.clone(), BTreeMap::new());
+        assert_eq!(legacy.estimate(&key), Duration::ZERO);
+        assert!(legacy.missing().is_empty());
+        let mut hybrid = TorchEstimator::new_replay(cache, BTreeMap::new());
+        hybrid.discard_zero_measurements();
+        assert_eq!(hybrid.estimate(&key), Duration::ZERO);
+        assert_eq!(hybrid.missing(), &[key]);
+        let identity = TorchCallInfo::ConvDType(input.clone(), Kind::Float);
+        let dropout = TorchCallInfo::Dropout(input, 0, true);
+        let mut noops = TorchEstimator::new_replay(HashMap::from([
+            (identity.clone(), Duration::ZERO), (dropout.clone(), Duration::ZERO),
+        ]), BTreeMap::new());
+        noops.discard_zero_measurements();
+        noops.estimate(&identity);
+        noops.estimate(&dropout);
+        assert!(noops.missing().is_empty());
     }
 }

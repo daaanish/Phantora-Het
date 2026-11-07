@@ -5,6 +5,10 @@ from phantora_utils import (
     install_phantora_megatron_moe_patches,
 )
 import os
+import sys
+if os.environ.get("PHANTORA") is not None and any(arg.split("=", 1)[0] == "--hybrid-preset" for arg in sys.argv):
+    from qwen_hybrid_kernels import install_simulation_kernels
+    install_simulation_kernels()
 import functools
 import torch
 from torch.utils.data import DataLoader
@@ -110,11 +114,16 @@ def get_model(
     expert_model_parallel_size=1,
     kv_channels=None,
     qk_layernorm=False,
+    hybrid_config=None,
 ):
     # MoE config is only added when num_moe_experts is set, so dense models are
     # unchanged. moe_token_dispatcher_type="alltoall" is what makes Megatron emit
     # the expert all-to-all (grouped ncclSend/ncclRecv across EP ranks).
     moe_config_kwargs = {}
+    if hybrid_config is not None:
+        from qwen_hybrid_model import require_hybrid_kernels, transformer_overrides
+        require_hybrid_kernels()
+        moe_config_kwargs.update(transformer_overrides(hybrid_config))
     if num_moe_experts is not None:
         moe_config_kwargs = dict(
             num_moe_experts=num_moe_experts,
@@ -145,16 +154,19 @@ def get_model(
         activation_func=torch.nn.functional.silu if swiglu else torch.nn.functional.gelu,
         normalization=normalization,
         add_bias_linear=not disable_bias_linear,
-        perform_initialization=False,
+        perform_initialization=hybrid_config is not None,
         bf16=True,
         params_dtype=torch.bfloat16,
         pipeline_dtype=torch.bfloat16,
-        attention_backend=AttnBackend.flash,
+        attention_backend=AttnBackend.local if hybrid_config is not None else AttnBackend.flash,
         recompute_granularity="selective" if recompute_activations else None,
         **moe_config_kwargs,
     )
 
-    if num_moe_experts is not None:
+    if hybrid_config is not None:
+        from qwen_hybrid_model import build_hybrid_spec
+        layer_spec = build_hybrid_spec(hybrid_config, parallel_state.get_pipeline_model_parallel_rank())
+    elif num_moe_experts is not None:
         layer_spec = get_gpt_layer_local_spec(
             num_experts=num_moe_experts,
             moe_grouped_gemm=False,
@@ -172,6 +184,8 @@ def get_model(
             max_sequence_length=sequence_length,
             position_embedding_type=position_embedding_type,
             rotary_base=rotary_base,
+            **(dict(rotary_percent=hybrid_config.model.partial_rotary_factor,
+                    share_embeddings_and_output_weights=False) if hybrid_config is not None else {}),
             pre_process=parallel_state.is_pipeline_first_stage(
                 ignore_virtual=False, vp_stage=vp_stage
             ),
@@ -182,6 +196,14 @@ def get_model(
         ),
     )
 
+    if hybrid_config is not None:
+        from qwen_hybrid_model import validate_hybrid_structure
+        import json
+        checked = validate_hybrid_structure(gpt_model, hybrid_config,
+            parallel_state.get_pipeline_model_parallel_rank())
+        print("HYBRID_STRUCTURE " + json.dumps(dict(layers=checked,
+            memory_validated=False, hf_whole_model_equivalence=False)), flush=True)
+
     dp_config = DDPConfig(
         use_distributed_optimizer=True,
         overlap_grad_reduce=True,
@@ -191,7 +213,11 @@ def get_model(
 
     model = DDP(transformer_config, dp_config, gpt_model)
     transformer_config.no_sync_func = model.no_sync
-    transformer_config.finalize_model_grads_func = finalize_model_grads
+    if hybrid_config is not None:
+        from qwen_hybrid_model import finalize_hybrid_grads
+        transformer_config.finalize_model_grads_func = finalize_hybrid_grads
+    else:
+        transformer_config.finalize_model_grads_func = finalize_model_grads
 
     return model
 
@@ -276,12 +302,19 @@ def main(
     expert_model_parallel_size=1,
     kv_channels=None,
     qk_layernorm=False,
+    hybrid_config=None,
 ):
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
+    if hybrid_config is not None:
+        from qwen_hybrid_model import require_hybrid_kernels
+        require_hybrid_kernels()
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
+    if hybrid_config is not None:
+        from qwen_hybrid_runtime_check import check_runtime
+        check_runtime()
     torch.cuda.memory.reset_peak_memory_stats(device)
 
     torch.distributed.init_process_group(
@@ -327,6 +360,7 @@ def main(
             expert_model_parallel_size=expert_model_parallel_size,
             kv_channels=kv_channels,
             qk_layernorm=qk_layernorm,
+            hybrid_config=hybrid_config,
         )
         model = model.to(device)
         model.train()
@@ -379,11 +413,31 @@ def main(
     optim = get_optimizer(model)
 
     pp_size = pipeline_model_parallel_size
-    num_microbatches = max(gradient_accumulation, pp_size * 4) \
-        if pp_size > 1 else gradient_accumulation
+    num_microbatches = gradient_accumulation if hybrid_config is not None else (
+        max(gradient_accumulation, pp_size * 4) if pp_size > 1 else gradient_accumulation
+    )
+    if hybrid_config is not None:
+        import json
+        from dataclasses import asdict
+        from qwen_hybrid_config import QWEN35_CONFIG_SOURCE, QWEN35_9B
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        print("HYBRID_CONFIG " + json.dumps(dict(
+            rank=rank, pp_rank=pp_rank, workload=asdict(hybrid_config),
+            layers=hybrid_config.pipeline_layers(pp_rank),
+            tokens_per_iteration=hybrid_config.tokens_per_iteration,
+            source=QWEN35_CONFIG_SOURCE if hybrid_config.model == QWEN35_9B else "synthetic debug dimensions",
+            memory_validated=False,
+            full_attention_backend="local_unfused",
+        ), sort_keys=True), flush=True)
 
     duras = []
     duras_wall = []
+    region = None
+    if hybrid_config is not None and os.environ.get("PHANTORA_COVERAGE") == "1":
+        from qwen_hybrid_control import TrainingRegion, expected_events
+        region = TrainingRegion(rank, world_size, expected_events(hybrid_config, pp_rank, iterations))
+        region.start_observer()
+        region.emit("start")
     for i in range(iterations):
         if virtual_pipeline_model_parallel_size is None:
             train_iterator = get_train_data_iterator(vocab_size, micro_batch_size, sequence_length)
@@ -433,9 +487,21 @@ def main(
         duras.append(end - start)
         duras_wall.append(end_wall - start_wall)
 
+    if region is not None:
+        region.stop_observer()
+        region.emit("finish")
+
+    if hybrid_config is not None:
+        print("HYBRID_METRICS " + json.dumps(dict(
+            version=1, run_id=os.environ.get("PHANTORA_RUN_ID"), rank=rank,
+            world_size=world_size, durations=duras, wall_durations=duras_wall,
+            tokens_per_iteration=hybrid_config.tokens_per_iteration,
+            iterations=iterations, memory_validated=False,
+        ), sort_keys=True), flush=True)
     peak_vram_mib = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
     print(f"Rank {rank} Time: {duras} Avg Time: {sum(duras[1:]) / (iterations - 1):.2f}\n", end="")
-    print(f"Rank {rank} Peak: {peak_vram_mib:<.2f}MiB\n", end="")
+    memory_label = " Peak (unvalidated hybrid memory)" if hybrid_config is not None else " Peak"
+    print(f"Rank {rank}{memory_label}: {peak_vram_mib:<.2f}MiB\n", end="")
     print(f"Rank {rank} Wall: {duras_wall} Avg Wall: {sum(duras_wall[1:]) / (iterations - 1):.2f}\n", end="")
     parallel_state.destroy_model_parallel()
     torch.distributed.destroy_process_group()
@@ -445,6 +511,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--hybrid-preset", choices=["debug", "9b"], default=None)
+    parser.add_argument("--global_batch_size", type=int, default=None)
+    parser.add_argument("--data_parallel_size", type=int, default=None)
     parser.add_argument("--tensor_parallel_size", type=int, default=4)
     parser.add_argument("--pipeline_model_parallel_size", type=int, default=1)
     parser.add_argument("--virtual_pipeline_model_parallel_size", type=int, default=None)
@@ -483,6 +552,18 @@ if __name__ == "__main__":
     parser.add_argument("--qk_layernorm", action="store_true",
         help="Apply RMSNorm to Q and K (QK-norm); used by Qwen3.")
     args = parser.parse_args()
+    hybrid_config = None
+    if args.hybrid_preset is not None:
+        import sys
+        from qwen_hybrid_config import configure_hybrid_args
+        try:
+            hybrid_config = configure_hybrid_args(args, sys.argv[1:], int(os.environ.get("WORLD_SIZE", "1")))
+        except ValueError as exc:
+            parser.error(str(exc))
+    elif args.global_batch_size is not None or args.data_parallel_size is not None:
+        parser.error("--global_batch_size/--data_parallel_size require --hybrid-preset")
+    if hybrid_config is not None and args.iterations < 2:
+        parser.error("--iterations must be at least 2 for a steady-state average")
 
     enable_function_tracer()
     main(
@@ -511,5 +592,6 @@ if __name__ == "__main__":
         expert_model_parallel_size=args.expert_model_parallel_size,
         kv_channels=args.kv_channels,
         qk_layernorm=args.qk_layernorm,
+        hybrid_config=hybrid_config,
     )
     disable_function_tracer()
