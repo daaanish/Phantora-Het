@@ -9,10 +9,11 @@ Megatron projections/MLPs and actual fused GDN kernel measurements. Add a clearl
 labeled dense Next-style adaptation after the Qwen3.5 milestone is validated.
 
 **Current phase:** local implementation/review batch finished; QH-02 Linux gate pending.
-**Immediate handoff task:** QH-P01 is in progress: review and publish this local
-implementation directly to `origin/main`, as the user requested. Vanilla remains
-in its separate checkout; a feature branch is not required for this workflow.
-**Next validation task:** on Linux x86_64 with the required CUDA stack, build the
+**GitHub handoff:** QH-P01 passed. Implementation commit
+`9adeef71f58c20b8210d387bd20d84405062d177` is published to `origin/main` and the
+remote SHA was verified. Vanilla remains in its separate checkout; the user's
+selected workflow uses main in Phantora-Het.
+**Next executable task:** on Linux x86_64 with the required CUDA stack, build the
 opt-in image, run native tests and runtime checks, then validate the existing
 recorded dense Llama workload in both default and upgraded images before Qwen.
 Follow the ordered commands in `tests/docker/megatron/HYBRID.md` and append actual
@@ -27,7 +28,11 @@ in small reviewed batches. Preserve user changes and existing runtime defaults.
 
 ## Baseline and environment
 
-- Repository: `301d9d976a13067cc0f5438912395a11efba5f8e` (`main`).
+- Initial repository commit: `301d9d976a13067cc0f5438912395a11efba5f8e` (`main`).
+- Published implementation revision:
+  [`9adeef71f58c20b8210d387bd20d84405062d177`](https://github.com/daaanish/Phantora-Het/commit/9adeef71f58c20b8210d387bd20d84405062d177),
+  43 task files, 4,816 insertions and 73 deletions. A tracker-only follow-up records
+  this actual publication evidence; it does not change the implementation revision.
 - Pre-existing untracked file: `AGENTS.md`; leave it intact.
 - Patched PyTorch gitlink: `bbb19f8c856fcf8d7c60267fecb976b4749e2cff`, branch
   `2.9.1-phantora`; submodule is not initialized locally.
@@ -58,6 +63,17 @@ in small reviewed batches. Preserve user changes and existing runtime defaults.
   `.cache/qwen-hybrid/` also stays local; its results are summarized below, and a
   Git clone will not contain those log files. No measured GPU timing DB exists yet.
 
+Prepared Linux checkout command (not executed on a Linux host in this session):
+
+```bash
+git clone --branch main --recurse-submodules https://github.com/daaanish/Phantora-Het.git
+cd Phantora-Het
+```
+
+For an existing checkout, use `git pull --ff-only origin main` followed by
+`git submodule update --init --recursive`. Continue with the ordered validation
+gates in `tests/docker/megatron/HYBRID.md` and record new results here.
+
 ## Tasks and gates
 
 States: planned / in progress / implemented / passed / failed / pending environment.
@@ -76,7 +92,7 @@ The four evidence columns are independent; implementation does not imply validat
 | QH-07 | Debug and full-depth replay matrix; QH-02 through 06/05a | Medium + parent review | executable commands prepared; execution pending | 10-case command preparation passed | pending environment | pending environment | Complete per-config coverage and expected computation/communication |
 | QH-08 | Hardware-matched calibration; QH-07 | Medium + parent review | report/compare tools prepared; execution pending | report math/mismatch cases passed | pending environment | pending environment | At most 10% steady-state iteration error in each accepted case |
 | QH-09 | Dense Next-style adaptation; QH-08 | Medium | planned | planned | pending environment | pending environment | Explicit dense adaptation; separate validated configurations |
-| QH-P01 | Publish the reviewed local batch for Linux handoff; QH-00 and local batch | Medium Git execution + parent review | in progress; ready to commit/push | preflight passed; existing CPU evidence retained | n/a | n/a | Reviewed task files committed and pushed to origin/main; remote commit verified; user-local instructions/logs preserved |
+| QH-P01 | Publish the reviewed local batch for Linux handoff; QH-00 and local batch | Medium Git execution + parent review | passed: implementation pushed to origin/main | preflight/staged checks and remote SHA verification passed; existing CPU evidence retained | n/a | n/a | Reviewed task files committed and pushed to origin/main; remote commit verified; user-local instructions/logs preserved |
 
 Before each task: record scope, dependencies, assumptions and acceptance checks.
 After each test/change: append command, result and artifact location; update the
@@ -221,6 +237,7 @@ one GPU can provide local kernel measurements but not multi-GPU ground truth.
 | 2026-10-29 | Final AST/whitespace and report CLI checks (Medium) | 22 Python files parsed and tracked diff check passed; [AST](.cache/qwen-hybrid/qh05a-parse-attempt-02.log), [diff](.cache/qwen-hybrid/qh05a-diff-check-attempt-03.log), [report help](.cache/qwen-hybrid/qh05a-report-help-attempt-01.log). Rust formatting/compilation remain unrun because the toolchain is unavailable |
 | 2026-11-07 | Publication preflight: git status, remote and baseline inspection (parent) | Still on main at 301d9d976a13067cc0f5438912395a11efba5f8e; 15 modified tracked files plus new Qwen files, tracker and pre-existing AGENTS.md. No commit or push had occurred. Medium begins remote/evidence/diff checks; this is not a new runtime validation |
 | 2026-11-07 | Publication preflight: fresh origin/main fetch, ancestry comparison, `git diff --check`, new-file whitespace/content inspection and saved-log review (Medium) | Passed: 43 task files (15 modified tracked, 28 new); local/fetched heads all equal the baseline, ahead/behind 0/0. No generated/binary/symlink/conflict-marker/common secret-pattern blocker found. Saved final logs confirm 61 passing CPU tests and 22 parsed files; task sources unchanged since that gate, so tests were not repeated. Restricted-DNS fetch failed; scoped elevated fetch succeeded. AGENTS.md and ignored logs excluded |
+| 2026-11-07 | Explicit-path `git add`, `git diff --cached --check`, scoped commit, `git push origin main`, `git ls-remote origin refs/heads/main`, `git status --short --branch` (Medium; parent reviewed commit/status/log) | Passed: implementation commit 9adeef71f58c20b8210d387bd20d84405062d177, 43 files. Normal push failed restricted DNS; scoped elevated retry succeeded without force. Remote main, local main and origin/main matched that exact SHA. Only pre-existing AGENTS.md remains untracked; PyTorch gitlink unchanged. [Publication log](.cache/qwen-hybrid/qhp01-publish.log). No runtime gate changed |
 
 ## Implementation map and remaining execution gates
 
@@ -338,6 +355,12 @@ hardware calibration. **Not achieved:** validated Qwen3.5 distributed simulation
 - 2026-11-07: Accepted the Medium agent's publication preflight for the 43 task
   files. Proceed with a normal commit and non-force push to the verified origin
   on main, then record the actual implementation commit and remote result here.
+- 2026-11-07: Implementation commit `9adeef71f58c20b8210d387bd20d84405062d177`
+  was pushed and independently checked against the remote main ref. Parent
+  reviewed the 43-file commit, clean task worktree and publication log. Record
+  this result in a tracker-only follow-up commit; resume QH-02 on Linux next.
+  The source is now transferable through GitHub; Linux/GPU validation and the
+  remaining operator/fidelity work remain pending.
 - Corrections to pasted specification: dense Qwen3.5 is an official target;
   dense Next is an adaptation; gated full attention and exact normalization matter;
   timing coverage must include surrounding ops and all rank-local/full-depth keys;
