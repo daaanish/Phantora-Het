@@ -49,6 +49,8 @@ tests/docker/megatron/gpu01/run.sh <name> --preset 0.8b --seq 8192 --base-db <db
 - `--preset`: `0.8b` (24 layers) or `0.8b-l4` (4 layers); `debug` and `9b` also exist.
 - `--base-db`: the timing database to start from. It is copied into the run, never changed.
 - `--stages`: any of `discovery,profile,replay,real` (default `discovery,profile,replay`).
+- `--mtp N`: train N multi-token-prediction layers (Qwen3.5 has 1). Default 0, as in every
+  run before QH-07w; applies to the simulated and the real stages alike.
 - Other options (`--mb`, `--ga`, `--tp`, `--iterations`, `--vram-mib`, `--sim-log`,
   `--expandable`) are listed at the top of `run.sh`. Defaults match the QH-07 sweeps:
   TP 2, micro-batch 1, accumulation 8, 4 iterations, 97,887 MiB simulated memory.

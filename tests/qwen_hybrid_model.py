@@ -58,6 +58,8 @@ def transformer_overrides(workload):
         layernorm_epsilon=model.rms_norm_eps, layernorm_zero_centered_gamma=True,
         bias_activation_fusion=False, bias_dropout_fusion=False,
         masked_softmax_fusion=False, persist_layer_norm=False,
+        # None (not 0) keeps Megatron's MTP code paths fully off, as in every run before QH-07w.
+        mtp_num_layers=workload.mtp_num_layers or None,
     )
 
 
@@ -67,32 +69,64 @@ def build_hybrid_spec(workload, pp_rank):
     if not callable(causal_conv1d_fn):
         raise RuntimeError("hybrid requires the fused causal_conv1d implementation")
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-    from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
-    from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
-    from megatron.core.transformer.spec_utils import ModuleSpec
     from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 
     base = get_gpt_layer_local_spec(normalization="RMSNorm", qk_layernorm=True)
-    layers = []
-    for _, layer_type in workload.pipeline_layers(pp_rank):
-        layer = deepcopy(base)
-        layer.submodules.input_layernorm = QwenRMSNorm
-        layer.submodules.pre_mlp_layernorm = QwenRMSNorm
-        if layer_type == "gdn":
-            layer.submodules.self_attention = ModuleSpec(
-                module=GatedDeltaNet,
-                params=dict(bias=False, conv_bias=False, use_qk_l2norm=True),
-                submodules=GatedDeltaNetSubmodules(
-                    in_proj=ColumnParallelLinear, out_norm=GDNOutputRMSNorm,
-                    out_proj=RowParallelLinear,
-                ),
-            )
-        else:
-            attention = layer.submodules.self_attention.submodules
-            attention.q_layernorm = QwenRMSNorm
-            attention.k_layernorm = QwenRMSNorm
-        layers.append(layer)
+    layers = [_layer_spec(base, layer_type) for _, layer_type in workload.pipeline_layers(pp_rank)]
     return TransformerBlockSubmodules(layer_specs=layers, layer_norm=QwenRMSNorm)
+
+
+def _layer_spec(base, layer_type):
+    from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+    from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+    layer = deepcopy(base)
+    layer.submodules.input_layernorm = QwenRMSNorm
+    layer.submodules.pre_mlp_layernorm = QwenRMSNorm
+    if layer_type == "gdn":
+        layer.submodules.self_attention = ModuleSpec(
+            module=GatedDeltaNet,
+            params=dict(bias=False, conv_bias=False, use_qk_l2norm=True),
+            submodules=GatedDeltaNetSubmodules(
+                in_proj=ColumnParallelLinear, out_norm=GDNOutputRMSNorm,
+                out_proj=RowParallelLinear,
+            ),
+        )
+    else:
+        attention = layer.submodules.self_attention.submodules
+        attention.q_layernorm = QwenRMSNorm
+        attention.k_layernorm = QwenRMSNorm
+    return layer
+
+
+def build_hybrid_mtp_spec(workload, pp_rank):
+    """Qwen3.5 MTP block for the stage that owns it, or None.
+
+    Checkpoint layout (mtp.*): pre_fc_norm_embedding / pre_fc_norm_hidden -> fc (2h -> h) ->
+    one gated full-attention layer with Q/K norm and dense SwiGLU MLP -> norm -> the shared,
+    tied LM head. Megatron's MTP layer has the same pieces (enorm, hnorm, eh_proj,
+    transformer_layer, final_layernorm); the norms here are Qwen's zero-centered RMSNorm.
+    """
+    if not workload.mtp_num_layers or pp_rank != workload.pipeline_parallel_size - 1:
+        return None
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+    from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+    from megatron.core.transformer.multi_token_prediction import (
+        MultiTokenPredictionBlockSubmodules, MultiTokenPredictionLayer,
+        MultiTokenPredictionLayerSubmodules,
+    )
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+    base = get_gpt_layer_local_spec(normalization="RMSNorm", qk_layernorm=True)
+    layer = ModuleSpec(
+        module=MultiTokenPredictionLayer,
+        submodules=MultiTokenPredictionLayerSubmodules(
+            enorm=QwenRMSNorm, hnorm=QwenRMSNorm, eh_proj=ColumnParallelLinear,
+            transformer_layer=_layer_spec(base, "full_attention"), layer_norm=QwenRMSNorm,
+        ),
+    )
+    return MultiTokenPredictionBlockSubmodules(layer_specs=[layer] * workload.mtp_num_layers)
 
 
 def finalize_hybrid_grads(model, *args, **kwargs):
@@ -155,4 +189,25 @@ def validate_hybrid_structure(model, workload, pp_rank):
             shape(attention.q_layernorm.weight, (dims.head_dim,), "Q norm")
             shape(attention.k_layernorm.weight, (dims.head_dim,), "K norm")
         checked.append(dict(global_layer=global_index, kind=kind))
+    mtp = getattr(model, "mtp", None)
+    owns_mtp = workload.mtp_num_layers and pp_rank == workload.pipeline_parallel_size - 1
+    if not owns_mtp:
+        if mtp is not None:
+            raise RuntimeError("hybrid MTP block built on a stage that should not own it")
+        return checked
+    if mtp is None or len(mtp.layers) != workload.mtp_num_layers:
+        raise RuntimeError("hybrid MTP layer count mismatch")
+    for depth, mtp_layer in enumerate(mtp.layers):
+        shape(mtp_layer.eh_proj.weight, (dims.hidden_size // tp, 2 * dims.hidden_size), "MTP eh_proj")
+        for name in ("enorm", "hnorm", "final_layernorm"):
+            if not isinstance(getattr(mtp_layer, name), QwenRMSNorm):
+                raise RuntimeError(f"hybrid MTP {name} is not Qwen RMSNorm")
+        layer = mtp_layer.transformer_layer
+        attention = layer.self_attention
+        if attention.__class__.__name__ == "GatedDeltaNet":
+            raise RuntimeError("hybrid MTP layer must use full attention")
+        shape(attention.linear_qkv.weight, ((2 * dims.num_attention_heads + 2 * dims.num_query_groups) * dims.head_dim // tp, dims.hidden_size), "MTP gated QKV")
+        shape(attention.q_layernorm.weight, (dims.head_dim,), "MTP Q norm")
+        shape(layer.mlp.linear_fc1.weight, (2 * dims.ffn_hidden_size // tp, dims.hidden_size), "MTP SwiGLU fc1")
+        checked.append(dict(mtp_depth=depth, kind="mtp_full_attention"))
     return checked

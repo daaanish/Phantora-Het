@@ -32,6 +32,7 @@ parser.add_argument("--micro-batch-size", type=int, default=1)
 parser.add_argument("--gradient-accumulation", type=int, default=8)
 parser.add_argument("--tensor-parallel-size", type=int, default=2)
 parser.add_argument("--iterations", type=int, default=4)
+parser.add_argument("--mtp-layers", type=int, default=0, help="trained MTP layers (0 = off)")
 parser.add_argument("--vram-mib", type=int, default=97887)
 parser.add_argument("--sim-log-level", default="info", help="simulator log level; debug enables per-event aggregation")
 parser.add_argument("--timeout-s", type=int, default=1500)
@@ -54,7 +55,8 @@ TP = args.tensor_parallel_size
 WORKLOAD = HybridConfig(model=HYBRID_PRESETS[args.preset], tensor_parallel_size=TP, world_size=TP,
                         sequence_length=args.sequence_length, micro_batch_size=args.micro_batch_size,
                         gradient_accumulation=args.gradient_accumulation,
-                        global_batch_size=args.micro_batch_size * args.gradient_accumulation)
+                        global_batch_size=args.micro_batch_size * args.gradient_accumulation,
+                        mtp_num_layers=args.mtp_layers)
 ITERATIONS = args.iterations
 HOST = "gpu01.pronet.rcac.purdue.edu"
 GPU = "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
@@ -124,7 +126,8 @@ def prepare(output, shared):
                         "--micro_batch_size", str(args.micro_batch_size),
                         "--global_batch_size", str(args.micro_batch_size * args.gradient_accumulation),
                         "--gradient_accumulation", str(args.gradient_accumulation),
-                        "--iterations", str(ITERATIONS)], runner_env),
+                        "--iterations", str(ITERATIONS),
+                        *(["--mtp-layers", str(args.mtp_layers)] if args.mtp_layers else [])], runner_env),
     )
     write_json(output / "commands.json", commands)
     write_json(output / "workload.json", dict(

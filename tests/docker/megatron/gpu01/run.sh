@@ -8,6 +8,7 @@
 #   --ga N            gradient accumulation (default 8)
 #   --tp N            tensor-parallel size = GPUs (default 2)
 #   --iterations N    training iterations (default 4; step time = mean of iterations 2..N, slower rank)
+#   --mtp N           train N multi-token-prediction layers (default 0 = off; Qwen3.5 has 1)
 #   --vram-mib M      simulated GPU memory (default 97887; seq 32768 needed 131072)
 #   --sim-log LEVEL   replay simulator log level (default debug: keeps per-event charges in events.jsonl.gz)
 #   --expandable / --no-expandable   PYTORCH_CUDA_ALLOC_CONF=expandable_segments for the real run
@@ -24,18 +25,19 @@ source "$here/paths.sh"
 name=${1:?usage: run.sh <name> --preset P --seq N [options]}; shift
 [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || ph_die "name may use letters, digits, . _ - only"
 preset="" seq="" stages="discovery,profile,replay" base_db="" mb=1 ga=8 tp=2 iters=4 vram=97887
-sim_log=debug expandable="" allow_unpushed=0
+sim_log=debug expandable="" allow_unpushed=0 mtp=0
 while (( $# )); do
     case $1 in
         --preset) preset=$2; shift 2;; --seq) seq=$2; shift 2;; --stages) stages=$2; shift 2;;
         --base-db) base_db=$(cd "$2" && pwd); shift 2;; --mb) mb=$2; shift 2;; --ga) ga=$2; shift 2;;
         --tp) tp=$2; shift 2;; --iterations) iters=$2; shift 2;; --vram-mib) vram=$2; shift 2;;
         --sim-log) sim_log=$2; shift 2;; --expandable) expandable=1; shift;; --no-expandable) expandable=0; shift;;
-        --allow-unpushed) allow_unpushed=1; shift;;
+        --allow-unpushed) allow_unpushed=1; shift;; --mtp) mtp=$2; shift 2;;
         *) ph_die "unknown option $1";;
     esac
 done
 [[ -n $preset && -n $seq ]] || ph_die "--preset and --seq are required"
+[[ $mtp =~ ^[0-9]+$ ]] || ph_die "--mtp takes a non-negative integer"
 [[ -z $expandable ]] && { [[ $preset == 0.8b-l4 ]] && expandable=1 || expandable=0; }
 has() { [[ ",$stages," == *",$1,"* ]]; }
 for s in ${stages//,/ }; do [[ $s =~ ^(discovery|profile|replay|real)$ ]] || ph_die "unknown stage $s"; done
@@ -64,11 +66,11 @@ cp "$build/build.json" "$run/build.json"
 python3 - "$run/config.json" <<P
 import json, sys
 json.dump(dict(name="$name", commit="$commit", preset="$preset", sequence_length=$seq, micro_batch_size=$mb,
-               gradient_accumulation=$ga, tensor_parallel_size=$tp, iterations=$iters, vram_mib=$vram,
+               gradient_accumulation=$ga, tensor_parallel_size=$tp, iterations=$iters, vram_mib=$vram, mtp_layers=$mtp,
                stages="$stages".split(","), base_db="$base_db" or None, sim_log_level="$sim_log",
                real_expandable_segments=bool($expandable), host="$(hostname)"), open(sys.argv[1], "w"), indent=1)
 P
-ph_log "run $run: $preset seq $seq, stages $stages, commit ${commit:0:8}"
+ph_log "run $run: $preset seq $seq, mtp $mtp, stages $stages, commit ${commit:0:8}"
 scratch=$(mktemp -d "$PH_SCRATCH/ph-run-XXXXXX")
 trap 'rm -rf -- "$scratch"' EXIT
 
@@ -78,7 +80,7 @@ simulate() {  # <perf-db> <stage> <log-level>
         --torch-prefix "$torch_dir/torch-deps" --causal-prefix "$PH_ENV/causal-deps" --upgraded-prefix "$PH_ENV/upgraded-deps" \
         --perf-db "$1" --calibrated-netconfig "$g/netconfig.toml" --output-dir "$out" \
         --preset "$preset" --sequence-length "$seq" --micro-batch-size "$mb" --gradient-accumulation "$ga" \
-        --tensor-parallel-size "$tp" --iterations "$iters" --vram-mib "$vram" --sim-log-level "$3" \
+        --tensor-parallel-size "$tp" --iterations "$iters" --vram-mib "$vram" --sim-log-level "$3" --mtp-layers "$mtp" \
         > "$run/$2.log" 2>&1 || rc=$?
     local o; o=$(ls -d "$out"/discover-* 2>/dev/null | head -1)
     mkdir -p "$run/$2"
@@ -144,7 +146,7 @@ if has real; then
     rc=0
     APPTAINERENV_CUDA_VISIBLE_DEVICES="$gpus" APPTAINERENV_QH_TORCH_REVISION="$torch_rev" APPTAINERENV_QH_TP=$tp \
     APPTAINERENV_QH_PRESET=$preset APPTAINERENV_QH_SEQ=$seq APPTAINERENV_QH_MB=$mb APPTAINERENV_QH_GBS=$((mb * ga)) \
-    APPTAINERENV_QH_ITERS=$iters APPTAINERENV_QH_EXPANDABLE=$expandable \
+    APPTAINERENV_QH_ITERS=$iters APPTAINERENV_QH_EXPANDABLE=$expandable APPTAINERENV_QH_MTP=$mtp \
         timeout -k 25 3600 apptainer exec --containall --cleanenv --nv \
         --bind "$binds_common,$scratch/rcache:/qh-cache" --pwd /qh-run "$PH_SIF" bash "/qh-src/tests/docker/megatron/gpu01/real_inside.sh" \
         > "$r/trainer.log" 2>&1 || rc=$?

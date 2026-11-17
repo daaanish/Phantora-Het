@@ -15,4 +15,4 @@ cd /qh-run/real
 exec torchrun --standalone --nproc-per-node="$QH_TP" --log-dir=/qh-run/real/ranks --redirects=3 /qh-src/tests/test_megatron.py \
     --hybrid-preset "$QH_PRESET" --tensor_parallel_size "$QH_TP" --data_parallel_size 1 \
     --pipeline_model_parallel_size 1 --sequence_length "$QH_SEQ" --micro_batch_size "$QH_MB" \
-    --global_batch_size "$QH_GBS" --iterations "$QH_ITERS"
+    --global_batch_size "$QH_GBS" --iterations "$QH_ITERS" --mtp-layers "${QH_MTP:-0}"

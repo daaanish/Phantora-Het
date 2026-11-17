@@ -168,9 +168,11 @@ def get_model(
         **moe_config_kwargs,
     )
 
+    mtp_block_spec = None
     if hybrid_config is not None:
-        from qwen_hybrid_model import build_hybrid_spec
+        from qwen_hybrid_model import build_hybrid_mtp_spec, build_hybrid_spec
         layer_spec = build_hybrid_spec(hybrid_config, parallel_state.get_pipeline_model_parallel_rank())
+        mtp_block_spec = build_hybrid_mtp_spec(hybrid_config, parallel_state.get_pipeline_model_parallel_rank())
     elif num_moe_experts is not None:
         layer_spec = get_gpt_layer_local_spec(
             num_experts=num_moe_experts,
@@ -191,6 +193,8 @@ def get_model(
             rotary_base=rotary_base,
             **(dict(rotary_percent=hybrid_config.model.partial_rotary_factor,
                     share_embeddings_and_output_weights=hybrid_config.model.tie_word_embeddings) if hybrid_config is not None else {}),
+            # Only passed when MTP is on, so runs without it build GPTModel exactly as before.
+            **(dict(mtp_block_spec=mtp_block_spec) if mtp_block_spec is not None else {}),
             pre_process=parallel_state.is_pipeline_first_stage(
                 ignore_virtual=False, vp_stage=vp_stage
             ),
@@ -541,6 +545,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--hybrid-preset", choices=HYBRID_PRESETS, default=None)
+    parser.add_argument("--mtp-layers", type=int, default=0,
+        help="Train this many multi-token-prediction layers (hybrid presets only; Qwen3.5 has 1). Default 0 = off.")
     parser.add_argument("--global_batch_size", type=int, default=None)
     parser.add_argument("--data_parallel_size", type=int, default=None)
     parser.add_argument("--tensor_parallel_size", type=int, default=4)
@@ -593,6 +599,8 @@ if __name__ == "__main__":
             parser.error(str(exc))
     elif args.global_batch_size is not None or args.data_parallel_size is not None:
         parser.error("--global_batch_size/--data_parallel_size require --hybrid-preset")
+    elif args.mtp_layers:
+        parser.error("--mtp-layers requires --hybrid-preset")
     if hybrid_config is not None and args.iterations < 2:
         parser.error("--iterations must be at least 2 for a steady-state average")
 

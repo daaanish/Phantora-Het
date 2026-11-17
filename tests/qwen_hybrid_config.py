@@ -43,6 +43,9 @@ class ModelSpec:
     rms_norm_eps: float = 1e-6
     rotary_base: float = 10000000.0
     tie_word_embeddings: bool = False
+    # MTP depth of the released checkpoint (HF mtp_num_hidden_layers); 0 for fixtures without one.
+    # The workload decides whether to train it (HybridConfig.mtp_num_layers).
+    mtp_num_hidden_layers: int = 0
 
     def __post_init__(self):
         for name in (
@@ -52,6 +55,8 @@ class ModelSpec:
             "linear_key_head_dim", "linear_value_head_dim", "conv_kernel_dim",
         ):
             _positive_int(name, getattr(self, name))
+        if type(self.mtp_num_hidden_layers) is not int or self.mtp_num_hidden_layers < 0:
+            raise ValueError("mtp_num_hidden_layers must be a non-negative integer")
         if self.num_attention_heads % self.num_query_groups:
             raise ValueError("num_attention_heads must be divisible by num_query_groups")
         if self.linear_num_value_heads % self.linear_num_key_heads:
@@ -85,6 +90,7 @@ QWEN35_9B = ModelSpec(
     ffn_hidden_size=12288, vocab_size=248320, num_attention_heads=16,
     num_query_groups=4, head_dim=256, linear_num_key_heads=16,
     linear_num_value_heads=32, linear_key_head_dim=128, linear_value_head_dim=128,
+    mtp_num_hidden_layers=1,
 )
 
 
@@ -93,7 +99,7 @@ QWEN35_08B = ModelSpec(
     ffn_hidden_size=3584, vocab_size=248320, num_attention_heads=8,
     num_query_groups=2, head_dim=256, linear_num_key_heads=16,
     linear_num_value_heads=16, linear_key_head_dim=128, linear_value_head_dim=128,
-    tie_word_embeddings=True,
+    tie_word_embeddings=True, mtp_num_hidden_layers=1,
 )
 
 # Reduced-depth timing fixture: 0.8B layer shapes, one 3 GDN + 1 full-attention group.
@@ -127,7 +133,8 @@ class HybridConfig:
     packed_sequences: bool = False
     use_cache: bool = False
     vision: bool = False
-    mtp: bool = False
+    # Trained MTP depth (Megatron mtp_num_layers); 0 = off, the behaviour of every run before QH-07w.
+    mtp_num_layers: int = 0
     dtype: str = "bfloat16"
 
     def __post_init__(self):
@@ -144,7 +151,13 @@ class HybridConfig:
             raise ValueError("hybrid initially requires CP=1 and EP=1")
         if self.virtual_pipeline_size is not None:
             raise ValueError("virtual pipeline parallelism is unsupported")
-        for name in ("sequence_parallel", "recompute_activations", "packed_sequences", "use_cache", "vision", "mtp"):
+        if type(self.mtp_num_layers) is not int or self.mtp_num_layers < 0:
+            raise ValueError("mtp_num_layers must be a non-negative integer")
+        if self.mtp_num_layers > self.model.mtp_num_hidden_layers:
+            raise ValueError(f"mtp_num_layers exceeds the {self.model.mtp_num_hidden_layers} MTP layer(s) of {self.model.name}")
+        if self.mtp_num_layers and self.model.layer_types[-1] != "full_attention":
+            raise ValueError("MTP reuses the last decoder layer's spec, which must be full attention")
+        for name in ("sequence_parallel", "recompute_activations", "packed_sequences", "use_cache", "vision"):
             if getattr(self, name):
                 raise ValueError(f"{name} is unsupported for the initial hybrid workload")
         if self.dtype != "bfloat16":
@@ -222,4 +235,5 @@ def configure_hybrid_args(args, argv, world_size):
         expert_parallel_size=args.expert_model_parallel_size,
         virtual_pipeline_size=args.virtual_pipeline_model_parallel_size,
         recompute_activations=args.recompute_activations,
+        mtp_num_layers=getattr(args, "mtp_layers", 0),
     )

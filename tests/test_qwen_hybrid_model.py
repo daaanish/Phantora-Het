@@ -10,7 +10,7 @@ import torch
 
 from qwen_hybrid_config import DEBUG_MODEL, HybridConfig, configure_hybrid_args
 from qwen_hybrid_model import (
-    GDNOutputRMSNorm, QwenRMSNorm, build_hybrid_spec,
+    GDNOutputRMSNorm, QwenRMSNorm, build_hybrid_mtp_spec, build_hybrid_spec,
     finalize_hybrid_grads, require_hybrid_kernels, transformer_overrides, validate_hybrid_structure,
 )
 
@@ -151,6 +151,73 @@ class HybridModelTests(unittest.TestCase):
                 self.assertIs(attention.submodules.q_layernorm, QwenRMSNorm)
                 self.assertIs(attention.submodules.k_layernorm, QwenRMSNorm)
 
+    def test_mtp_spec_is_qwen_full_attention_on_last_stage_only(self):
+        class GDN: pass
+        class Column: pass
+        class Row: pass
+        class MTPLayer: pass
+
+        def local_spec(**kwargs):
+            return SimpleNamespace(submodules=SimpleNamespace(
+                self_attention=SimpleNamespace(module="full", submodules=SimpleNamespace()),
+                mlp=SimpleNamespace(module="local_mlp"),
+            ))
+
+        modules = fake_modules({
+            "megatron.core.models.gpt.gpt_layer_specs": {"get_gpt_layer_local_spec": local_spec},
+            "megatron.core.ssm.gated_delta_net": {"GatedDeltaNet": GDN, "GatedDeltaNetSubmodules": SimpleNamespace},
+            "megatron.core.tensor_parallel.layers": {"ColumnParallelLinear": Column, "RowParallelLinear": Row},
+            "megatron.core.transformer.spec_utils": {"ModuleSpec": SimpleNamespace},
+            "megatron.core.transformer.multi_token_prediction": {
+                "MultiTokenPredictionBlockSubmodules": SimpleNamespace, "MultiTokenPredictionLayer": MTPLayer,
+                "MultiTokenPredictionLayerSubmodules": SimpleNamespace},
+        })
+        model = replace(DEBUG_MODEL, num_layers=8, mtp_num_hidden_layers=1)
+        config = HybridConfig(model=model, pipeline_parallel_size=2, world_size=2, mtp_num_layers=1)
+        with patch.dict(sys.modules, modules):
+            self.assertIsNone(build_hybrid_mtp_spec(config, 0))
+            self.assertIsNone(build_hybrid_mtp_spec(replace(config, mtp_num_layers=0), 1))
+            spec = build_hybrid_mtp_spec(config, 1)
+        self.assertEqual(len(spec.layer_specs), 1)
+        layer = spec.layer_specs[0]
+        self.assertIs(layer.module, MTPLayer)
+        sub = layer.submodules
+        for norm in (sub.enorm, sub.hnorm, sub.layer_norm):
+            self.assertIs(norm, QwenRMSNorm)
+        self.assertIs(sub.eh_proj, Column)
+        self.assertEqual(sub.transformer_layer.submodules.self_attention.module, "full")
+        self.assertIs(sub.transformer_layer.submodules.self_attention.submodules.q_layernorm, QwenRMSNorm)
+        self.assertIs(sub.transformer_layer.submodules.input_layernorm, QwenRMSNorm)
+
+    def test_structure_guard_checks_mtp_block(self):
+        model = replace(DEBUG_MODEL, mtp_num_hidden_layers=1)
+        workload = HybridConfig(model=model, mtp_num_layers=1)
+        dims = workload.model
+        def full_layer():
+            attention = SimpleNamespace(
+                linear_qkv=SimpleNamespace(weight=torch.empty((2 * dims.num_attention_heads + 2 * dims.num_query_groups) * dims.head_dim, dims.hidden_size)),
+                q_layernorm=SimpleNamespace(weight=torch.empty(dims.head_dim)))
+            mlp = SimpleNamespace(linear_fc1=SimpleNamespace(weight=torch.empty(2 * dims.ffn_hidden_size, dims.hidden_size)))
+            return SimpleNamespace(self_attention=attention, mlp=mlp)
+        config = SimpleNamespace(params_dtype=torch.float32, sequence_parallel=False, use_cpu_initialization=True)
+        norm = lambda: QwenRMSNorm(config, dims.hidden_size)
+        mtp_layer = SimpleNamespace(eh_proj=SimpleNamespace(weight=torch.empty(dims.hidden_size, 2 * dims.hidden_size)),
+                                    enorm=norm(), hnorm=norm(), final_layernorm=norm(), transformer_layer=full_layer())
+        # Decoder layers are covered above; here the stage has none, so only the MTP block is checked.
+        bare = SimpleNamespace(decoder=SimpleNamespace(layers=[]))
+        no_layers = workload
+        with patch.object(HybridConfig, "pipeline_layers", return_value=()):
+            with self.assertRaisesRegex(RuntimeError, "MTP layer count"):
+                validate_hybrid_structure(bare, no_layers, 0)
+            bare.mtp = SimpleNamespace(layers=[mtp_layer])
+            checked = validate_hybrid_structure(bare, no_layers, 0)
+            self.assertEqual(checked, [dict(mtp_depth=0, kind="mtp_full_attention")])
+            mtp_layer.hnorm = SimpleNamespace()
+            with self.assertRaisesRegex(RuntimeError, "hnorm"):
+                validate_hybrid_structure(bare, no_layers, 0)
+            with self.assertRaisesRegex(RuntimeError, "should not own"):
+                validate_hybrid_structure(bare, replace(no_layers, mtp_num_layers=0), 0)
+
     def test_finalize_keeps_megatron_and_sums_only_gdn_scale(self):
         grad = torch.ones(8)
         param = SimpleNamespace(main_grad=grad, requires_grad=True)
@@ -175,6 +242,9 @@ class HybridModelTests(unittest.TestCase):
         self.assertEqual(overrides["attention_dropout"], 0)
         self.assertEqual(overrides["hidden_dropout"], 0)
         self.assertEqual(overrides["layernorm_epsilon"], 1e-6)
+        self.assertIsNone(overrides["mtp_num_layers"])
+        mtp = HybridConfig(model=replace(DEBUG_MODEL, mtp_num_hidden_layers=1), mtp_num_layers=1)
+        self.assertEqual(transformer_overrides(mtp)["mtp_num_layers"], 1)
 
 
 class HybridCliTests(unittest.TestCase):
@@ -196,6 +266,19 @@ class HybridCliTests(unittest.TestCase):
         self.assertEqual(args.sequence_length, 128)
         self.assertEqual(args.normalization, "RMSNorm")
         self.assertTrue(args.qk_layernorm)
+
+    def test_mtp_layers_flag_reaches_workload(self):
+        args = self.args()
+        args.hybrid_preset = "0.8b"
+        args.tensor_parallel_size = 2
+        self.assertEqual(configure_hybrid_args(args, ["--tensor_parallel_size", "2"], 2).mtp_num_layers, 0)
+        args = self.args()
+        args.hybrid_preset, args.tensor_parallel_size, args.mtp_layers = "0.8b", 2, 1
+        self.assertEqual(configure_hybrid_args(args, ["--tensor_parallel_size", "2", "--mtp-layers", "1"], 2).mtp_num_layers, 1)
+        args = self.args()
+        args.mtp_layers = 1
+        with self.assertRaisesRegex(ValueError, "MTP layer"):
+            configure_hybrid_args(args, ["--mtp-layers", "1"], 1)
 
     def test_explicit_accumulation_is_not_rewritten(self):
         args = self.args()

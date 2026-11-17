@@ -78,10 +78,26 @@ class HybridConfigTests(unittest.TestCase):
         cases = {"context_parallel_size": 2, "expert_parallel_size": 2,
                  "sequence_parallel": True, "virtual_pipeline_size": 1,
                  "recompute_activations": True, "packed_sequences": True,
-                 "use_cache": True, "vision": True, "mtp": True, "dtype": "float16"}
+                 "use_cache": True, "vision": True, "dtype": "float16"}
         for name, value in cases.items():
             with self.subTest(name=name), self.assertRaises(ValueError):
                 HybridConfig(**{name: value})
+
+    def test_mtp_depth_bounded_by_checkpoint(self):
+        from qwen_hybrid_config import QWEN35_08B, QWEN35_08B_L4, QWEN35_9B
+        for model in (QWEN35_08B, QWEN35_08B_L4, QWEN35_9B):
+            self.assertEqual(model.mtp_num_hidden_layers, 1)
+            self.assertEqual(HybridConfig(model=model, tensor_parallel_size=2, world_size=2, mtp_num_layers=1).mtp_num_layers, 1)
+        self.assertEqual(HybridConfig().mtp_num_layers, 0)
+        for value in (-1, True, 1.0):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                HybridConfig(model=QWEN35_08B, mtp_num_layers=value)
+        with self.assertRaisesRegex(ValueError, "MTP layer"):
+            HybridConfig(model=QWEN35_08B, mtp_num_layers=2)
+        with self.assertRaisesRegex(ValueError, "MTP layer"):
+            HybridConfig(mtp_num_layers=1)  # debug fixture has no MTP layer
+        with self.assertRaisesRegex(ValueError, "full attention"):
+            HybridConfig(model=replace(DEBUG_MODEL, num_layers=5, mtp_num_hidden_layers=1), mtp_num_layers=1)
 
     def test_partition_and_head_divisibility(self):
         for model, kwargs in (
