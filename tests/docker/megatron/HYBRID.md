@@ -109,6 +109,10 @@ rather than falling linearly: for 4096–16384 the shortfall is close to
 0.13 s + 0.207 × replay time, which would level off near −17%. The CSV is in
 `results/qwen35_08b_sequence_sweep/` at the repository root.
 
+**Running on gpu01:** from 2026-11-17 every gpu01 run goes through
+[gpu01/README.md](gpu01/README.md): runs start from a pushed commit and record it.
+The QH-02 to QH-07v run directories predate this and stay as records.
+
 **Attribution at 8192 (2026-11-16):** A traced real step against a replay with
 per-event logging splits the 670 ms gap into 350 ms of GPU compute Phantora does
 not charge, 269 ms with the GPU empty between kernels, and 51 ms of all-reduce.

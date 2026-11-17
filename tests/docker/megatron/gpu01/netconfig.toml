@@ -1,0 +1,16 @@
+host_mapping = ["gpu01.pronet.rcac.purdue.edu"]
+
+[simulator]
+loopback_speed = 271.91597719
+fairness = "PerFlowMaxMin"
+
+[topology]
+type = "TwoLayerMultiPath"
+
+[topology.args]
+nspines = 2
+nracks = 1
+rack_size = 2
+host_bw = 800
+rack_uplink_port_bw = 800
+load_balancer_type = "EcmpEverything"
