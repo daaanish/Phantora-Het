@@ -1,0 +1,23 @@
+--- a/torch/csrc/profiler/standalone/function_tracer.cpp	2026-11-17 16:59:30
++++ b/torch/csrc/profiler/standalone/function_tracer.cpp	2026-11-17 16:59:30
+@@ -105,11 +105,20 @@
+       auto shape = vectorToString(t.sizes().vec());
+       auto dtype = t.dtype().toScalarType();
+       auto device = deviceStr(t.device());
++      // Phantora: layout (strides and storage offset, in elements) lets the
++      // profiler rebuild the real memory layout. Only strided tensors have it.
++      std::string layout;
++      if (t.layout() == c10::kStrided) {
++        layout = concat(",",
++          "\"stride\":", vectorToString(t.strides().vec()), ",",
++          "\"offset\":", t.storage_offset());
++      }
+       return concat("{",
+         "\"type\":", "\"Tensor\",",
+         "\"shape\":", shape, ",",
+         "\"dtype\":", static_cast<int32_t>(dtype), ",",
+         "\"device\":", "\"", device, "\"",
++        layout,
+       "}");
+     } else {
+       return std::nullopt;

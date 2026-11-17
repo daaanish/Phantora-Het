@@ -545,6 +545,17 @@ mod tests {
             Duration::from_nanos(28_800),
         );
 
+        // Layout-carrying copies (cat members with strides and offsets), next to the
+        // same op without layouts: both must load back as distinct keys.
+        let cat = |layouts| TorchCallInfo::QwenOp {
+            op: "cat".into(),
+            inputs: vec![ti(&[1, 8192, 4, 128], Kind::BFloat16), ti(&[1, 8192, 4, 128], Kind::BFloat16)],
+            scalars: vec![], dims: vec![2], keepdim: false, dtype: None, layouts,
+        };
+        let layout = |offset| crate::torch_call::Layout { stride: vec![0, 1024, 128, 1], offset };
+        db.compute.insert(cat(vec![layout(0), layout(512)]), Duration::from_nanos(233_000));
+        db.compute.insert(cat(vec![]), Duration::from_nanos(81_000));
+
         db.memcpy
             .insert((CudaMemcpyKind::HostToDevice, 1_048_576), Duration::from_nanos(45_600));
         db.memcpy

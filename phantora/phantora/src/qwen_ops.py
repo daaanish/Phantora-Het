@@ -6,14 +6,26 @@ import struct
 import torch
 
 
-def build(payload, allocator=None):
+DTYPES = {"Float": torch.float32, "Half": torch.float16, "BFloat16": torch.bfloat16,
+          "Double": torch.float64}
+
+
+def strided(info, layout, device="cuda"):
+    """A tensor with the traced shape, strides and storage offset, on its own storage."""
+    shape, stride, offset = info["shape"], layout["stride"], layout["offset"]
+    extent = offset + 1 + sum((dim - 1) * step for dim, step in zip(shape, stride))
+    storage = torch.randn(extent, dtype=DTYPES[info["dtype"]], device=device)
+    return storage.as_strided(shape, stride, offset)
+
+
+def build(payload, allocator=None, device="cuda"):
     if isinstance(payload, str):
         payload = json.loads(payload)["QwenOp"]
     cache = {}
+    layouts = payload.get("layouts") or []
 
     def allocate(info):
-        dtype = {"Float": torch.float32, "Half": torch.float16, "BFloat16": torch.bfloat16,
-                 "Double": torch.float64}[info["dtype"]]
+        dtype = DTYPES[info["dtype"]]
         size = 1
         for dim in info["shape"]:
             size *= dim
@@ -22,7 +34,14 @@ def build(payload, allocator=None):
             cache[key] = torch.randn(size, dtype=dtype, device="cuda")
         return cache[key].view(info["shape"])
 
-    inputs = [(allocator or allocate)(info) for info in payload["inputs"]]
+    if layouts:
+        # The trace recorded each input's layout: rebuild it exactly, distinct storage
+        # per input, instead of the shared buffers and guessed source below.
+        if len(layouts) != len(payload["inputs"]):
+            raise ValueError("layouts must match inputs one to one")
+        inputs = [strided(info, layout, device) for info, layout in zip(payload["inputs"], layouts)]
+    else:
+        inputs = [(allocator or allocate)(info) for info in payload["inputs"]]
     scalars = [struct.unpack(">d", bits.to_bytes(8, "big"))[0] for bits in payload["scalars"]]
     op = payload["op"]
     if op in ("mean", "sum"):
@@ -51,8 +70,11 @@ def build(payload, allocator=None):
             seen.update((id(value), value.data_ptr()))
         return lambda: torch.ops.aten.cat(members, payload["dims"][0])
     if op == "contiguous":
-        # The trace has no strides. Replay a real strided copy: a source of the recorded
-        # shape whose storage has two dimensions swapped.
+        if layouts:
+            source = inputs[0]
+            return lambda: source.contiguous()
+        # Older traces have no strides. Replay a real strided copy: a source of the
+        # recorded shape whose storage has two dimensions swapped.
         shape = list(inputs[0].shape)
         source = None
         for first in range(len(shape) - 1, 0, -1):

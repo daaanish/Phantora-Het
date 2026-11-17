@@ -69,6 +69,45 @@ class QwenOpTests(unittest.TestCase):
         self.assertEqual(tuple(result.shape), (2, 3))
         self.assertTrue(result.is_contiguous())
 
+    def test_traced_layouts_are_rebuilt_exactly(self):
+        # contiguous of a transposed [1,8,4,16] source, as the layout-aware tracer sends it.
+        payload = self.payload("contiguous")
+        payload["inputs"] = [dict(shape=[1, 8, 4, 16], dtype="Float")]
+        payload["layouts"] = [dict(stride=[0, 16, 128, 1], offset=0)]
+        seen = []
+        original = torch.Tensor.contiguous
+
+        def spy(tensor, *args, **kwargs):
+            seen.append((tensor.stride(), tensor.storage_offset()))
+            return original(tensor, *args, **kwargs)
+
+        thunk = build(payload, allocator=lambda info: self.fail("allocator used"), device="cpu")
+        torch.Tensor.contiguous = spy
+        try:
+            result = thunk()
+        finally:
+            torch.Tensor.contiguous = original
+        self.assertEqual(seen, [((0, 16, 128, 1), 0)])
+        self.assertTrue(result.is_contiguous())
+        # cat members keep their own strides and storage offsets, on distinct storage.
+        payload = self.payload("cat", dims=[1])
+        payload["inputs"] = [dict(shape=[2, 3], dtype="Float")] * 2
+        payload["layouts"] = [dict(stride=[1, 2], offset=0), dict(stride=[5, 1], offset=7)]
+        captured = []
+        real_cat = torch.ops.aten.cat
+        thunk = build(payload, device="cpu")
+        try:
+            torch.ops.aten.cat = lambda members, dim: captured.extend(members) or real_cat(members, dim)
+            result = thunk()
+        finally:
+            torch.ops.aten.cat = real_cat
+        self.assertEqual([(m.stride(), m.storage_offset()) for m in captured], [((1, 2), 0), ((5, 1), 7)])
+        self.assertNotEqual(captured[0].data_ptr(), captured[1].data_ptr())
+        self.assertEqual(tuple(result.shape), (2, 6))
+        payload["layouts"] = payload["layouts"][:1]
+        with self.assertRaises(ValueError):
+            build(payload, device="cpu")
+
     def test_gate_forward_and_backward_dispatch(self):
         value = torch.ones(2, 3)
         for name in ("exp", "neg", "sigmoid", "silu", "rsqrt", "softplus"):

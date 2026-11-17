@@ -38,6 +38,11 @@ pub enum TorchValueJson {
         shape: Vec<i64>,
         dtype: i32,
         device: String,
+        // Sent by the layout-aware tracer patch; absent from older tracers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stride: Option<Vec<i64>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<i64>,
     },
     Tuple {
         elements: Vec<TorchValueJson>,
@@ -69,10 +74,13 @@ impl TorchValueJson {
                 shape,
                 dtype,
                 device,
+                stride,
+                offset,
             } => {
                 let dtype = tch::Kind::from_c_int(dtype).unwrap();
                 let device = parse_device(device);
-                TorchValue::Tensor(shape, dtype, device)
+                let layout = stride.and_then(|stride| Layout::new(&shape, stride, offset.unwrap_or(0)));
+                TorchValue::Tensor(shape, dtype, device, layout)
             }
             TorchValueJson::Tuple { elements } => {
                 let elements = elements
@@ -149,9 +157,29 @@ impl TorchCallMsg {
     }
 }
 
+/// Memory layout of a traced tensor, in elements. Strides of size-1 dimensions do
+/// not affect which elements are read, so they are stored as 0 to keep keys stable.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Layout {
+    pub stride: Vec<i64>,
+    pub offset: i64,
+}
+
+impl Layout {
+    pub fn new(shape: &[i64], mut stride: Vec<i64>, offset: i64) -> Option<Layout> {
+        if stride.len() != shape.len() || offset < 0 || stride.iter().any(|&s| s < 0) {
+            return None;
+        }
+        for (s, &d) in stride.iter_mut().zip(shape) {
+            if d == 1 { *s = 0; }
+        }
+        Some(Layout { stride, offset })
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TorchValue {
-    Tensor(Vec<i64>, tch::Kind, tch::Device),
+    Tensor(Vec<i64>, tch::Kind, tch::Device, Option<Layout>),
     Tuple(Vec<TorchValue>),
     List(Vec<TorchValue>),
     Double(f64),
@@ -165,7 +193,7 @@ pub enum TorchValue {
 impl TorchValue {
     pub fn gpu_index(&self) -> Option<usize> {
         match self {
-            TorchValue::Tensor(_, _, device) => match device {
+            TorchValue::Tensor(_, _, device, ..) => match device {
                 tch::Device::Cuda(i) => Some(*i as usize),
                 _ => None,
             },
@@ -181,7 +209,7 @@ fn maybe_tensor_list(value: &[TorchValue]) -> Option<Vec<TensorInfo>> {
     value
         .iter()
         .map(|v| match v {
-            TorchValue::Tensor(shape, dtype, _) => Some(TensorInfo {
+            TorchValue::Tensor(shape, dtype, _, ..) => Some(TensorInfo {
                 shape: shape.clone(),
                 dtype: *dtype,
             }),
@@ -201,14 +229,18 @@ fn qwen_call(op: &str, args: &[TorchValue]) -> Option<TorchCallInfo> {
     let mut dims = Vec::new();
     let mut keepdim = false;
     let mut dtype = None;
+    // Memory layouts of `inputs`, kept only for copies whose cost depends on them.
+    // Empty when the tracer sent none, so those keys match the shape-only ones.
+    let mut layouts = Vec::new();
+    let layout = |value: &TorchValue| match value { Tensor(_, _, _, layout) => layout.clone(), _ => None };
     let tensor = |value: &TorchValue| match value {
-        Tensor(shape, kind, _) => Some(TensorInfo { shape: shape.clone(), dtype: *kind }), _ => None,
+        Tensor(shape, kind, _, ..) => Some(TensorInfo { shape: shape.clone(), dtype: *kind }), _ => None,
     };
     let mut key_op = op;
     match (op, args) {
         ("exp", [
-            x @ Tensor(shape, kind, tch::Device::Cuda(device)),
-            out @ Tensor(out_shape, out_kind, tch::Device::Cuda(out_device)),
+            x @ Tensor(shape, kind, tch::Device::Cuda(device), ..),
+            out @ Tensor(out_shape, out_kind, tch::Device::Cuda(out_device), ..),
         ])
             if shape == out_shape && kind == out_kind && device == out_device
                 && matches!(kind, tch::Kind::Float | tch::Kind::Half | tch::Kind::BFloat16 | tch::Kind::Double) =>
@@ -220,13 +252,14 @@ fn qwen_call(op: &str, args: &[TorchValue]) -> Option<TorchCallInfo> {
         // Concatenation always copies. Members keep their order; the axis is normalized.
         ("cat", [List(values), Int(dim)]) => {
             let (kind, device) = match values.first() {
-                Some(Tensor(_, kind, tch::Device::Cuda(device))) => (*kind, *device), _ => return None,
+                Some(Tensor(_, kind, tch::Device::Cuda(device), ..)) => (*kind, *device), _ => return None,
             };
             if !matches!(kind, tch::Kind::Float | tch::Kind::Half | tch::Kind::BFloat16 | tch::Kind::Double) { return None; }
             for value in values {
                 match value {
-                    Tensor(shape, k, tch::Device::Cuda(d)) if *k == kind && *d == device && !shape.is_empty() => {
+                    Tensor(shape, k, tch::Device::Cuda(d), ..) if *k == kind && *d == device && !shape.is_empty() => {
                         inputs.push(tensor(value)?);
+                        layouts.push(layout(value));
                     }
                     _ => return None,
                 }
@@ -237,13 +270,15 @@ fn qwen_call(op: &str, args: &[TorchValue]) -> Option<TorchCallInfo> {
             dims.push(dim);
         }
         // Only calls that really copy reach the tracer: the simulation wrapper returns
-        // already-contiguous tensors unchanged. The trace has no strides, so the key is
-        // shape and dtype and the profiler replays a strided source.
-        ("contiguous", [x @ Tensor(shape, kind, tch::Device::Cuda(_)), Int(0)])
+        // already-contiguous tensors unchanged. With a layout-aware tracer the key carries
+        // the source layout; without one it is shape and dtype and the profiler replays a
+        // guessed strided source.
+        ("contiguous", [x @ Tensor(shape, kind, tch::Device::Cuda(_), ..), Int(0)])
             if shape.len() >= 2
                 && matches!(kind, tch::Kind::Float | tch::Kind::Half | tch::Kind::BFloat16 | tch::Kind::Double) =>
         {
             inputs.push(tensor(x)?);
+            layouts.push(layout(x));
         }
         ("sigmoid_backward" | "silu_backward", [grad, x]) => {
             inputs.extend([tensor(grad)?, tensor(x)?]);
@@ -292,7 +327,9 @@ fn qwen_call(op: &str, args: &[TorchValue]) -> Option<TorchCallInfo> {
         }
         _ => return None,
     }
-    Some(TorchCallInfo::QwenOp { op: key_op.into(), inputs, scalars, dims, keepdim, dtype })
+    // All or nothing: a partial layout list would mix real and guessed sources.
+    let layouts = layouts.into_iter().collect::<Option<Vec<Layout>>>().unwrap_or_default();
+    Some(TorchCallInfo::QwenOp { op: key_op.into(), inputs, scalars, dims, keepdim, dtype, layouts })
 }
 
 impl TorchCallMsg {
@@ -321,7 +358,7 @@ impl TorchCallMsg {
         let mut recognized = true;
         let call_info = match self.name.as_ref() {
             "aten::mm" => match self.args.as_slice() {
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _)] => Some(TorchCallInfo::MM(
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..)] => Some(TorchCallInfo::MM(
                     TensorInfo {
                         shape: shape1.clone(),
                         dtype: *kind1,
@@ -337,7 +374,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::matmul" => match self.args.as_slice() {
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _)] => {
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..)] => {
                     Some(TorchCallInfo::MatMul(
                         TensorInfo {
                             shape: shape1.clone(),
@@ -355,7 +392,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::linear" => match self.args.as_slice() {
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _)] => {
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..)] => {
                     Some(TorchCallInfo::Linear(
                         TensorInfo {
                             shape: shape1.clone(),
@@ -368,7 +405,7 @@ impl TorchCallMsg {
                         None,
                     ))
                 }
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _)] => {
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..), Tensor(shape3, kind3, _, ..)] => {
                     Some(TorchCallInfo::Linear(
                         TensorInfo {
                             shape: shape1.clone(),
@@ -390,7 +427,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::bmm" => match self.args.as_slice() {
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _)] => Some(TorchCallInfo::BMM(
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..)] => Some(TorchCallInfo::BMM(
                     TensorInfo {
                         shape: shape1.clone(),
                         dtype: *kind1,
@@ -406,7 +443,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::addmm" => match self.args.as_slice() {
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), ..] => {
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..), Tensor(shape3, kind3, _, ..), ..] => {
                     Some(TorchCallInfo::AddMM(
                         TensorInfo {
                             shape: shape1.clone(),
@@ -428,7 +465,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::baddbmm" => match self.args.as_slice() {
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), ..] => {
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..), Tensor(shape3, kind3, _, ..), ..] => {
                     Some(TorchCallInfo::BAddBMM(
                         TensorInfo {
                             shape: shape1.clone(),
@@ -450,7 +487,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::mul" => match self.args.as_slice() {
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _)] => Some(TorchCallInfo::Mul(
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..)] => Some(TorchCallInfo::Mul(
                     TensorInfo {
                         shape: shape1.clone(),
                         dtype: *kind1,
@@ -460,7 +497,7 @@ impl TorchCallMsg {
                         dtype: *kind2,
                     },
                 )),
-                [Tensor(shape, kind, _), _] => Some(TorchCallInfo::MulScalar(TensorInfo {
+                [Tensor(shape, kind, _, ..), _] => Some(TorchCallInfo::MulScalar(TensorInfo {
                     shape: shape.clone(),
                     dtype: *kind,
                 })),
@@ -470,7 +507,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::mul_" => match self.args.as_slice() {
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _)] => Some(TorchCallInfo::Mul_(
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..)] => Some(TorchCallInfo::Mul_(
                     TensorInfo {
                         shape: shape1.clone(),
                         dtype: *kind1,
@@ -480,7 +517,7 @@ impl TorchCallMsg {
                         dtype: *kind2,
                     },
                 )),
-                [Tensor(shape, kind, _), _] => Some(TorchCallInfo::MulScalar_(TensorInfo {
+                [Tensor(shape, kind, _, ..), _] => Some(TorchCallInfo::MulScalar_(TensorInfo {
                     shape: shape.clone(),
                     dtype: *kind,
                 })),
@@ -513,7 +550,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::add" => match self.args.as_slice() {
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), ..] => {
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..), ..] => {
                     Some(TorchCallInfo::Add(
                         TensorInfo {
                             shape: shape1.clone(),
@@ -531,7 +568,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::add_" => match self.args.as_slice() {
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), ..] => {
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..), ..] => {
                     Some(TorchCallInfo::Add_(
                         TensorInfo {
                             shape: shape1.clone(),
@@ -549,7 +586,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::div" => match self.args.as_slice() {
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _)] => Some(TorchCallInfo::Div(
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..)] => Some(TorchCallInfo::Div(
                     TensorInfo {
                         shape: shape1.clone(),
                         dtype: *kind1,
@@ -559,7 +596,7 @@ impl TorchCallMsg {
                         dtype: *kind2,
                     },
                 )),
-                [Tensor(shape, kind, _), _] => Some(TorchCallInfo::DivScalar(TensorInfo {
+                [Tensor(shape, kind, _, ..), _] => Some(TorchCallInfo::DivScalar(TensorInfo {
                     shape: shape.clone(),
                     dtype: *kind,
                 })),
@@ -570,7 +607,7 @@ impl TorchCallMsg {
             },
             "aten::pow" if hybrid => qwen_call("pow", &self.args),
             "aten::pow" => match self.args.as_slice() {
-                [Tensor(shape, kind, _), _] | [_, Tensor(shape, kind, _)] => Some(TorchCallInfo::Pow(TensorInfo {
+                [Tensor(shape, kind, _, ..), _] | [_, Tensor(shape, kind, _, ..)] => Some(TorchCallInfo::Pow(TensorInfo {
                     shape: shape.clone(), dtype: *kind,
                 })),
                 _ => None,
@@ -581,7 +618,7 @@ impl TorchCallMsg {
                 qwen_call(self.name.trim_start_matches("aten::"), &self.args)
             }
             "aten::addcmul_" => match self.args.as_slice() {
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), ..] => {
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..), Tensor(shape3, kind3, _, ..), ..] => {
                     Some(TorchCallInfo::AddCMul_(
                         TensorInfo {
                             shape: shape1.clone(),
@@ -603,7 +640,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::addcdiv_" => match self.args.as_slice() {
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), ..] => {
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..), Tensor(shape3, kind3, _, ..), ..] => {
                     Some(TorchCallInfo::AddCDiv_(
                         TensorInfo {
                             shape: shape1.clone(),
@@ -673,7 +710,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::masked_fill" => match self.args.as_slice() {
-                [Tensor(shape, kind, _), Tensor(mask_shape, mask_kind, _), ..] => {
+                [Tensor(shape, kind, _, ..), Tensor(mask_shape, mask_kind, _, ..), ..] => {
                     Some(TorchCallInfo::MaskedFill(
                         TensorInfo {
                             shape: shape.clone(),
@@ -691,7 +728,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::masked_fill_" => match self.args.as_slice() {
-                [Tensor(shape, kind, _), Tensor(mask_shape, mask_kind, _), ..] => {
+                [Tensor(shape, kind, _, ..), Tensor(mask_shape, mask_kind, _, ..), ..] => {
                     Some(TorchCallInfo::MaskedFill_(
                         TensorInfo {
                             shape: shape.clone(),
@@ -709,7 +746,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::dropout" => match self.args.as_slice() {
-                [Tensor(shape, kind, _), Double(p), Bool(train)] => Some(TorchCallInfo::Dropout(
+                [Tensor(shape, kind, _, ..), Double(p), Bool(train)] => Some(TorchCallInfo::Dropout(
                     TensorInfo {
                         shape: shape.clone(),
                         dtype: *kind,
@@ -723,7 +760,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::native_dropout" => match self.args.as_slice() {
-                [Tensor(shape, kind, _), Double(p), Bool(train)] => {
+                [Tensor(shape, kind, _, ..), Double(p), Bool(train)] => {
                     Some(TorchCallInfo::NativeDropout(
                         TensorInfo {
                             shape: shape.clone(),
@@ -739,7 +776,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::native_dropout_backward" => match self.args.as_slice() {
-                [Tensor(grad_shape, grad_kind, _), Tensor(mask_shape, mask_kind, _), Double(scale)] => {
+                [Tensor(grad_shape, grad_kind, _, ..), Tensor(mask_shape, mask_kind, _, ..), Double(scale)] => {
                     Some(TorchCallInfo::NativeDropoutBackward(
                         TensorInfo {
                             shape: grad_shape.clone(),
@@ -758,7 +795,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::_fused_dropout" => match self.args.as_slice() {
-                [Tensor(shape, kind, _), Double(p)] => Some(TorchCallInfo::FusedDropout(
+                [Tensor(shape, kind, _, ..), Double(p)] => Some(TorchCallInfo::FusedDropout(
                     TensorInfo {
                         shape: shape.clone(),
                         dtype: *kind,
@@ -771,7 +808,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::where" => match self.args.as_slice() {
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _)] => {
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..), Tensor(shape3, kind3, _, ..)] => {
                     Some(TorchCallInfo::Where(
                         TensorInfo {
                             shape: shape1.clone(),
@@ -787,7 +824,7 @@ impl TorchCallMsg {
                         },
                     ))
                 }
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), _] => {
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..), _] => {
                     Some(TorchCallInfo::WhereScalar(
                         TensorInfo {
                             shape: shape1.clone(),
@@ -805,7 +842,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::sqrt" => match self.args.as_slice() {
-                [Tensor(shape, kind, _)] => Some(TorchCallInfo::Sqrt(TensorInfo {
+                [Tensor(shape, kind, _, ..)] => Some(TorchCallInfo::Sqrt(TensorInfo {
                     shape: shape.clone(),
                     dtype: *kind,
                 })),
@@ -815,7 +852,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::gelu" => match self.args.as_slice() {
-                [Tensor(shape, kind, _), ..] => Some(TorchCallInfo::Gelu(TensorInfo {
+                [Tensor(shape, kind, _, ..), ..] => Some(TorchCallInfo::Gelu(TensorInfo {
                     shape: shape.clone(),
                     dtype: *kind,
                 })),
@@ -825,7 +862,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::gelu_backward" => match self.args.as_slice() {
-                [Tensor(grad_shape, grad_kind, _), Tensor(self_shape, self_kind, _), ..] => {
+                [Tensor(grad_shape, grad_kind, _, ..), Tensor(self_shape, self_kind, _, ..), ..] => {
                     Some(TorchCallInfo::GeluBackward(
                         TensorInfo {
                             shape: grad_shape.clone(),
@@ -844,13 +881,13 @@ impl TorchCallMsg {
             },
             "aten::sum" if hybrid => qwen_call("sum", &self.args),
             "aten::sum" => match self.args.as_slice() {
-                [Tensor(shape, kind, _), ..] => Some(TorchCallInfo::Sum(TensorInfo {
+                [Tensor(shape, kind, _, ..), ..] => Some(TorchCallInfo::Sum(TensorInfo {
                     shape: shape.clone(), dtype: *kind,
                 })),
                 _ => None,
             },
             "aten::softmax" => match self.args.as_slice() {
-                [Tensor(shape, kind, _), Int(dim), ..] => Some(TorchCallInfo::Softmax(
+                [Tensor(shape, kind, _, ..), Int(dim), ..] => Some(TorchCallInfo::Softmax(
                     TensorInfo {
                         shape: shape.clone(),
                         dtype: *kind,
@@ -863,7 +900,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::_softmax_backward_data" => match self.args.as_slice() {
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Int(dim), ..] => {
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..), Int(dim), ..] => {
                     Some(TorchCallInfo::SoftmaxBackward(
                         TensorInfo {
                             shape: shape1.clone(),
@@ -882,7 +919,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::zeros_like" => match self.args.as_slice() {
-                [Tensor(shape, kind, _), ..] => Some(TorchCallInfo::ZerosLike(TensorInfo {
+                [Tensor(shape, kind, _, ..), ..] => Some(TorchCallInfo::ZerosLike(TensorInfo {
                     shape: shape.clone(),
                     dtype: *kind,
                 })),
@@ -893,7 +930,7 @@ impl TorchCallMsg {
             },
             "aten::to" if hybrid => qwen_call("to", &self.args),
             "aten::to" => match self.args.as_slice() {
-                [Tensor(shape, kind, _), Int(dtype_idx), Bool(_), Bool(_)] => {
+                [Tensor(shape, kind, _, ..), Int(dtype_idx), Bool(_), Bool(_)] => {
                     Some(TorchCallInfo::ConvDType(
                         TensorInfo {
                             shape: shape.clone(),
@@ -909,8 +946,8 @@ impl TorchCallMsg {
                 }
             },
             "aten::scaled_dot_product_attention" => match self.args.as_slice() {
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), Tensor(mask_shape, mask_kind, _), Double(_), Bool(causal), Double(_), Bool(gqa)]
-                | [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), Tensor(mask_shape, mask_kind, _), Double(_), Bool(causal), Bool(gqa)] => {
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..), Tensor(shape3, kind3, _, ..), Tensor(mask_shape, mask_kind, _, ..), Double(_), Bool(causal), Double(_), Bool(gqa)]
+                | [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..), Tensor(shape3, kind3, _, ..), Tensor(mask_shape, mask_kind, _, ..), Double(_), Bool(causal), Bool(gqa)] => {
                     Some(TorchCallInfo::SDPA {
                         q: TensorInfo {
                             shape: shape1.clone(),
@@ -932,8 +969,8 @@ impl TorchCallMsg {
                         gqa: *gqa,
                     })
                 }
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), Double(_), Bool(causal), Double(_), Bool(gqa)]
-                | [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), Double(_), Bool(causal), Bool(gqa)] => {
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..), Tensor(shape3, kind3, _, ..), Double(_), Bool(causal), Double(_), Bool(gqa)]
+                | [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..), Tensor(shape3, kind3, _, ..), Double(_), Bool(causal), Bool(gqa)] => {
                     Some(TorchCallInfo::SDPA {
                         q: TensorInfo {
                             shape: shape1.clone(),
@@ -958,7 +995,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::_scaled_dot_product_flash_attention_backward" => match self.args.as_slice() {
-                [Tensor(shape1, kind1, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), Tensor(shape4, kind4, _), Tensor(shape5, kind5, _), Tensor(shape6, kind6, _), Int(max_q), Int(max_k), _, Bool(causal), _, _, _] => {
+                [Tensor(shape1, kind1, _, ..), Tensor(shape2, kind2, _, ..), Tensor(shape3, kind3, _, ..), Tensor(shape4, kind4, _, ..), Tensor(shape5, kind5, _, ..), Tensor(shape6, kind6, _, ..), Int(max_q), Int(max_k), _, Bool(causal), _, _, _] => {
                     Some(TorchCallInfo::SDPABackward {
                         grad: TensorInfo {
                             shape: shape1.clone(),
@@ -995,7 +1032,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::_scaled_dot_product_efficient_attention_backward" => match self.args.as_slice() {
-                [Tensor(_, _, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), Tensor(shape4, kind4, _), bias_arg, Tensor(_, _, _), Tensor(_, _, _), _, _, Double(_), List(_), Bool(causal), ..] => {
+                [Tensor(_, _, _, ..), Tensor(shape2, kind2, _, ..), Tensor(shape3, kind3, _, ..), Tensor(shape4, kind4, _, ..), bias_arg, Tensor(_, _, _, ..), Tensor(_, _, _, ..), _, _, Double(_), List(_), Bool(causal), ..] => {
                     Some(TorchCallInfo::SDPAEfficientBackward {
                         q: TensorInfo {
                             shape: shape2.clone(),
@@ -1010,7 +1047,7 @@ impl TorchCallMsg {
                             dtype: *kind4,
                         },
                         bias: match bias_arg {
-                            Tensor(bias_shape, bias_kind, _) => Some(TensorInfo {
+                            Tensor(bias_shape, bias_kind, _, ..) => Some(TensorInfo {
                                 shape: bias_shape.clone(),
                                 dtype: *bias_kind,
                             }),
@@ -1019,7 +1056,7 @@ impl TorchCallMsg {
                         causal: *causal,
                     })
                 }
-                [Tensor(_, _, _), Tensor(shape2, kind2, _), Tensor(shape3, kind3, _), Tensor(shape4, kind4, _), Tensor(_, _, _), Tensor(_, _, _), _, _, Double(_), List(_), Bool(causal), ..] => {
+                [Tensor(_, _, _, ..), Tensor(shape2, kind2, _, ..), Tensor(shape3, kind3, _, ..), Tensor(shape4, kind4, _, ..), Tensor(_, _, _, ..), Tensor(_, _, _, ..), _, _, Double(_), List(_), Bool(causal), ..] => {
                     Some(TorchCallInfo::SDPAEfficientBackward {
                         q: TensorInfo {
                             shape: shape2.clone(),
@@ -1043,7 +1080,7 @@ impl TorchCallMsg {
                 }
             },
             "aten::conv2d" => match self.args.as_slice() {
-                [Tensor(input_shape, input_kind, _), Tensor(weight_shape, weight_kind, _), List(stride), List(padding), List(dilation), Int(groups)] => {
+                [Tensor(input_shape, input_kind, _, ..), Tensor(weight_shape, weight_kind, _, ..), List(stride), List(padding), List(dilation), Int(groups)] => {
                     match stride.as_slice() {
                         [Int(s1), Int(s2)] => match padding.as_slice() {
                             [Int(p1), Int(p2)] => match dilation.as_slice() {
@@ -1069,7 +1106,7 @@ impl TorchCallMsg {
                         _ => None,
                     }
                 }
-                [Tensor(input_shape, input_kind, _), Tensor(weight_shape, weight_kind, _), Tensor(bias_shape, bias_kind, _), List(stride), List(padding), List(dilation), Int(groups)] => {
+                [Tensor(input_shape, input_kind, _, ..), Tensor(weight_shape, weight_kind, _, ..), Tensor(bias_shape, bias_kind, _, ..), List(stride), List(padding), List(dilation), Int(groups)] => {
                     match stride.as_slice() {
                         [Int(s1), Int(s2)] => match padding.as_slice() {
                             [Int(p1), Int(p2)] => match dilation.as_slice() {
@@ -1101,7 +1138,7 @@ impl TorchCallMsg {
                 _ => None,
             },
             "aten::_slow_conv2d_backward" => match self.args.as_slice() {
-                [Tensor(grad_output_shape, grad_output_kind, _), Tensor(input_shape, input_kind, _), Tensor(weight_shape, weight_kind, _), List(kernel), List(stride), List(padding), List(_)] => {
+                [Tensor(grad_output_shape, grad_output_kind, _, ..), Tensor(input_shape, input_kind, _, ..), Tensor(weight_shape, weight_kind, _, ..), List(kernel), List(stride), List(padding), List(_)] => {
                     match kernel.as_slice() {
                         [Int(k1), Int(k2)] => match stride.as_slice() {
                             [Int(s1), Int(s2)] => match padding.as_slice() {
@@ -1244,6 +1281,10 @@ pub enum TorchCallInfo {
     QwenOp {
         op: String, inputs: Vec<TensorInfo>, scalars: Vec<u64>, dims: Vec<i64>,
         keepdim: bool, dtype: Option<tch::Kind>,
+        // One per input when the trace carried layouts (cat, contiguous); else empty and
+        // omitted, so keys recorded before layouts existed still load and match.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        layouts: Vec<Layout>,
     },
 }
 
@@ -1259,7 +1300,7 @@ pub struct TorchCall {
 mod hybrid_tests {
     use super::*;
 
-    fn tensor() -> TorchValue { TorchValue::Tensor(vec![2, 3], tch::Kind::Float, tch::Device::Cuda(0)) }
+    fn tensor() -> TorchValue { TorchValue::Tensor(vec![2, 3], tch::Kind::Float, tch::Device::Cuda(0), None) }
     fn message(name: &str, args: Vec<TorchValue>) -> TorchCallMsg {
         TorchCallMsg { pid: 1, tid: 1, hostname: "host".into(), stream: Some((0, 0)), curr_time: 0, name: name.into(), args }
     }
@@ -1295,9 +1336,9 @@ mod hybrid_tests {
         }
         for out in [
             TorchValue::Bool(false),
-            TorchValue::Tensor(vec![3, 2], tch::Kind::Float, tch::Device::Cuda(0)),
-            TorchValue::Tensor(vec![2, 3], tch::Kind::Double, tch::Device::Cuda(0)),
-            TorchValue::Tensor(vec![2, 3], tch::Kind::Float, tch::Device::Cuda(1)),
+            TorchValue::Tensor(vec![3, 2], tch::Kind::Float, tch::Device::Cuda(0), None),
+            TorchValue::Tensor(vec![2, 3], tch::Kind::Double, tch::Device::Cuda(0), None),
+            TorchValue::Tensor(vec![2, 3], tch::Kind::Float, tch::Device::Cuda(1), None),
         ] {
             let (call, recognized) = message("aten::exp", vec![tensor(), out]).into_hybrid_classified_call(0);
             assert!(recognized && call.is_none());
@@ -1307,7 +1348,7 @@ mod hybrid_tests {
 
     #[test]
     fn qwen_cat_and_contiguous_are_opt_in_copies() {
-        let cuda = |shape: Vec<i64>, kind| TorchValue::Tensor(shape, kind, tch::Device::Cuda(0));
+        let cuda = |shape: Vec<i64>, kind| TorchValue::Tensor(shape, kind, tch::Device::Cuda(0), None);
         let list = || TorchValue::List(vec![cuda(vec![2, 3], tch::Kind::Float), cuda(vec![2, 5], tch::Kind::Float)]);
         assert!(message("aten::cat", vec![list(), TorchValue::Int(-1)]).into_call(0).is_none());
         assert!(matches!(
@@ -1338,6 +1379,41 @@ mod hybrid_tests {
             let (call, recognized) = message("aten::contiguous", bad).into_hybrid_classified_call(0);
             assert!(recognized && call.is_none());
         }
+    }
+
+    #[test]
+    fn traced_layouts_reach_copy_keys_and_legacy_traces_keep_old_keys() {
+        let call = |json: &str| {
+            serde_json::from_str::<TorchCallJson>(json).unwrap().into_msg().into_hybrid_call(0).unwrap().info
+        };
+        let wrap = |name: &str, args: &str| format!(
+            r#"{{"pid":1,"tid":1,"hostname":"h","stream":[0,0],"cur":0,"name":"{name}","args":[{args}]}}"#);
+        // Transposed [1,8192,8,128] source; the size-1 dimension's stride is normalized to 0.
+        let strided = r#"{"type":"Tensor","shape":[1,8192,8,128],"dtype":15,"device":"cuda:0","stride":[8388608,128,1048576,1],"offset":0}"#;
+        let legacy = r#"{"type":"Tensor","shape":[1,8192,8,128],"dtype":15,"device":"cuda:0"}"#;
+        let zero = r#"{"type":"Int","value":0}"#;
+        let with_layout = call(&wrap("aten::contiguous", &format!("{strided},{zero}")));
+        assert!(matches!(&with_layout, TorchCallInfo::QwenOp { layouts, .. }
+            if layouts == &vec![Layout { stride: vec![0, 128, 1048576, 1], offset: 0 }]));
+        let without = call(&wrap("aten::contiguous", &format!("{legacy},{zero}")));
+        assert!(matches!(&without, TorchCallInfo::QwenOp { layouts, .. } if layouts.is_empty()));
+        assert_ne!(with_layout, without);
+        // Keys recorded before layouts existed serialize and load unchanged.
+        let old_key = serde_json::to_string(&without).unwrap();
+        assert!(!old_key.contains("layouts"));
+        assert_eq!(serde_json::from_str::<TorchCallInfo>(&old_key).unwrap(), without);
+        // A cat whose members do not all carry layouts falls back to the shape-only key.
+        let offset = r#"{"type":"Tensor","shape":[1,8192,8,128],"dtype":15,"device":"cuda:0","stride":[8388608,2048,128,1],"offset":1024}"#;
+        let mixed = call(&wrap("aten::cat", &format!(r#"{{"type":"List","elements":[{offset},{legacy}]}},{{"type":"Int","value":2}}"#)));
+        assert!(matches!(&mixed, TorchCallInfo::QwenOp { layouts, .. } if layouts.is_empty()));
+        let both = call(&wrap("aten::cat", &format!(r#"{{"type":"List","elements":[{offset},{strided}]}},{{"type":"Int","value":2}}"#)));
+        assert!(matches!(&both, TorchCallInfo::QwenOp { layouts, .. } if layouts.len() == 2 && layouts[0].offset == 1024));
+        // Ordinary keys ignore layouts entirely.
+        let mm = |a: &str| serde_json::from_str::<TorchCallJson>(&wrap("aten::mm", &format!("{a},{a}")))
+            .unwrap().into_msg().into_call(0).unwrap().info;
+        let plain = r#"{"type":"Tensor","shape":[64,64],"dtype":15,"device":"cuda:0"}"#;
+        let laid = r#"{"type":"Tensor","shape":[64,64],"dtype":15,"device":"cuda:0","stride":[1,64],"offset":0}"#;
+        assert_eq!(mm(plain), mm(laid));
     }
 
     #[test]
