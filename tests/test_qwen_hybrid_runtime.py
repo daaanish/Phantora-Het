@@ -24,6 +24,23 @@ class RuntimeMetadataTests(unittest.TestCase):
                 patch.object(runtime.metadata, "requires", return_value=[]), patch("builtins.__import__", guarded):
             self.assertEqual(runtime.check_metadata(), versions)
 
+    def test_metadata_requires_fla_core_with_matching_wrapper_installed(self):
+        versions = dict(runtime.EXPECTED_STACK, torch="2.9.1")
+        versions.pop("fla-core")
+
+        def installed_version(name):
+            if name not in versions:
+                raise runtime.metadata.PackageNotFoundError(name)
+            return versions[name]
+
+        with patch.object(runtime.metadata, "version", side_effect=installed_version), \
+                patch.object(runtime.metadata, "requires", return_value=[]):
+            with self.assertRaisesRegex(runtime.metadata.PackageNotFoundError, "fla-core"):
+                runtime.check_metadata()
+            versions["fla-core"] = "0.4.1"
+            with self.assertRaisesRegex(RuntimeError, "fla-core: expected 0.4.0, found 0.4.1"):
+                runtime.check_metadata()
+
     def test_runtime_rejects_incorrect_patched_torch_revision(self):
         for revision in (None, "wrong-revision"):
             with self.subTest(revision=revision), patch.object(runtime, "check_metadata", return_value={}), \

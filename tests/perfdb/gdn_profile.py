@@ -29,8 +29,11 @@ def load_kernels(gpu, method):
     import torch
     if not torch.cuda.is_available() or torch.cuda.get_device_name(0) != gpu:
         raise RuntimeError("actual GPU does not match --gpu-name")
+    wrapper = metadata.version("flash-linear-attention")
+    if wrapper != PINS["fla"]:
+        raise RuntimeError(f'flash-linear-attention: expected {PINS["fla"]}, found {wrapper}')
     source = dict(gpu=gpu, torch=torch.__version__, torch_revision=torch.version.git_version, cuda=torch.version.cuda,
-        triton=metadata.version("triton"), fla=metadata.version("flash-linear-attention"),
+        triton=metadata.version("triton"), fla=metadata.version("fla-core"),
         causal_conv1d=metadata.version("causal-conv1d"), measurement=method)
     from gdn_common import validate_provenance
     validate_provenance(source, gpu)

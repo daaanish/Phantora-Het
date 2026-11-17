@@ -97,9 +97,11 @@ RUN ln -sf bash /usr/bin/sh
 FROM phantora-local AS phantora-hybrid
 RUN python3 -m pip install --no-cache-dir --no-deps \
       packaging==24.2 einops==0.8.1 ninja==1.11.1.4 && \
-    python3 -m pip install --no-cache-dir --no-deps megatron-core==0.16.0 flash-linear-attention==0.4.0
+    python3 -m pip install --no-cache-dir --no-deps \
+      megatron-core==0.16.0 flash-linear-attention==0.4.0 fla-core==0.4.0
 RUN CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=${MAX_JOBS:-4} \
-    python3 -m pip install --no-cache-dir --no-deps --no-build-isolation causal-conv1d==1.5.3.post1
+    python3 -m pip install --no-cache-dir --no-deps --no-build-isolation \
+      --no-binary causal-conv1d causal-conv1d==1.5.3.post1
 COPY tests/qwen_hybrid_config.py tests/qwen_hybrid_model.py tests/qwen_hybrid_kernels.py tests/qwen_hybrid_runtime_check.py /phantora/hybrid/
 RUN python3 /phantora/hybrid/qwen_hybrid_runtime_check.py --metadata-only
 

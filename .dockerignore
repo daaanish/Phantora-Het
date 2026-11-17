@@ -10,7 +10,11 @@ trace/
 .vscode/
 **/__pycache__/
 phantora/target/
-tests/
+tests/*
+!tests/qwen_hybrid_config.py
+!tests/qwen_hybrid_model.py
+!tests/qwen_hybrid_kernels.py
+!tests/qwen_hybrid_runtime_check.py
 
 # Copied from PyTorch
 

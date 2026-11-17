@@ -11,6 +11,7 @@ from packaging.version import Version
 
 EXPECTED_STACK = {
     "megatron-core": "0.16.0", "flash-linear-attention": "0.4.0",
+    "fla-core": "0.4.0",
     "causal-conv1d": "1.5.3.post1", "triton": "3.7.0",
     "transformers": "4.56.2", "deepspeed": "0.17.5",
     "torchtitan": "0.2.0", "numpy": "1.26.4",
@@ -23,7 +24,7 @@ def check_metadata():
         actual = metadata.version(name)
         if actual != version:
             raise RuntimeError(f"{name}: expected {version}, found {actual}")
-    for name in ("megatron-core", "flash-linear-attention", "causal-conv1d"):
+    for name in ("megatron-core", "flash-linear-attention", "fla-core", "causal-conv1d"):
         for dependency in metadata.requires(name) or []:
             requirement = Requirement(dependency)
             if requirement.marker is not None and not requirement.marker.evaluate({"extra": ""}):
