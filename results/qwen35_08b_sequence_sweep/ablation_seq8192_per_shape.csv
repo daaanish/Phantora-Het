@@ -1,0 +1,13 @@
+op,shape,phantora_calls_per_step,profiled_us_per_call,real_in_situ_us_per_call,profiled_over_real,within_15pct_gate,traced_layout_profiled_us_per_call_qh07u,traced_layout_over_real_qh07u,traced_layout_within_15pct_gate_qh07u
+contiguous,"[1,3072,8192] bf16",144,212.0,212.8,1.00,pass,202.0,0.95,pass
+contiguous,"[1,8192,8,128] bf16",576,13.0,55.6,0.23,FAIL,51.8,0.93,"pass (mean over 4 layouts: permuted 64 us x3 offsets, slice 16 us)"
+contiguous,"[8192,1,4,256] bf16",96,14.0,22.6,0.62,FAIL (real has 48 calls; the other 48 are fused into a compiled region),13.0,0.58,FAIL (real has 48 calls; the other 48 are fused into a compiled region)
+contiguous,"[1,8192,8] bf16",288,2.0,3.0,0.67,FAIL (small),2.5,0.83,FAIL (small)
+cat,"[1,8192,3072]+[1,8192,1024]+[1,8192,8]x2 (GDN split backward)",144,81.0,233.2,0.35,FAIL (real uses the generic strided-input kernel),230.0,0.99,pass
+cat,"[8192,1,1792]x2 (SwiGLU split backward, shared)",192,34.0,44.4,0.77,FAIL,43.0,0.97,pass
+cat,"[1,8192,1024]x3 (GDN)",144,28.0,39.4,0.71,FAIL,28.0,0.71,"FAIL (inputs are row-order; layout not the cause, see A9)"
+cat,"[8192,1,1,1024]x2+[8192,1,1,256]x2 (gated attention)",48,33.0,43.9,0.75,FAIL,32.0,0.73,"FAIL (inputs are row-order; layout not the cause, see A9)"
+cat,"[8192,1,4,64]+[8192,1,4,192] (rotary)",48,14.0,31.9,0.44,FAIL,32.0,1.00,pass
+cat,"[8192,1,4,32]x2 (rotary)",96,4.0,9.8,0.41,FAIL,9.5,0.97,pass
+cat,"[8192,1,1,64]+[8192,1,1,192] (rotary)",48,5.0,12.2,0.41,FAIL,12.0,0.98,pass
+cat,"[8192,1,1,32]x2 (rotary)",96,2.0,5.2,0.38,FAIL,4.5,0.87,pass

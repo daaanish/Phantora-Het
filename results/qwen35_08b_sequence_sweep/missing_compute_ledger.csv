@@ -1,0 +1,34 @@
+op_group,real_gpu_ms,phantora_charged_ms,shortfall_ms,handler_in_vanilla,scope,origin,note,status
+to (dtype conversion),317.146,196.610,120.536,yes,shared Megatron attention + cross-entropy,softmax-in-FP32 casts of attention scores and logits; backward casts use the multi-argument form,vanilla handles only the dtype-only form; 96 real vs 48 charged per direction at the score shape,open
+masked_fill,77.786,147.984,-70.198,yes,shared Megatron attention,attention mask fill on scores,"overcharged: timing includes the clone, and the intercepted memcpy is charged again",open
+contiguous,64.656,0.000,64.656,no,GDN-specific,stock Megatron GatedDeltaNet.forward: pre-conv transpose and _prepare_qkv copies,,"partly fixed (QH-07t ablation B): 39.9 of 64.7 ms charged; [1,3072,8192] matches in-situ, [1,8192,8,128] profiles 4x too fast (source layout unknown); layout fixed (QH-07u, traced strides): 60.9 of 64.7 ms charged; [1,8192,8,128] 52 vs 56 us (source is a three-way permutation); [8192,1,4,256] still 0.58 (fused-count mismatch)"
+cat,53.447,0.000,53.447,no,GDN-specific 39.3 ms; gated attention 2.1; SwiGLU (shared) 8.5; rotary 3.5,"backward of torch.split in GDN projections, gated-attention QKV, SwiGLU; rotary embedding",,"partly fixed (QH-07t ablation A): 25.3 of 53.4 ms charged; profiled timings 23-65% below in-situ, input strides unknown to the simulator; layout fixed (QH-07u, traced strides): 50.4 of 53.4 ms charged; GDN split backward 230 vs 233 us, rotary and SwiGLU within 13%; row-order GDN x3 and gated-attention cats still about 27% low (not layout, A9)"
+baddbmm,93.668,146.064,-52.396,yes,shared Megatron attention,attention scores,overcharged; cause unknown,open
+sub_,43.728,0.000,43.728,no,cross-entropy (any Megatron TP model),_VocabParallelCrossEntropy logits max-shift,,open
+mul,130.138,92.040,38.098,yes,RMSNorm / SwiGLU / GDN gates (mixed),norm scaling and gating multiplies,same-shape operands profile 2-3x too fast (operand aliasing suspected),open
+add_,42.890,5.488,37.402,yes,RMSNorm backward and gradient accumulation (shared),PowBackward0 / ToCopyBackward0 / AccumulateGrad,"about 780 calls per step at [seq,1,1024] not seen; others profile low",open
+_softmax_backward_data,203.386,172.080,31.306,yes,shared Megatron attention,softmax backward on scores,two real kernels per call,open
+max,21.269,0.000,21.269,no,cross-entropy (any Megatron TP model),_VocabParallelCrossEntropy,,open
+"fused GDN (conv, l2norm, chunk)",191.483,176.976,14.507,n/a,GDN-specific,fused kernel boundaries,"analysed QH-07t: per step real/charged ms conv fwd 2.8/2.0, conv bwd 41.4/40.7, l2norm fwd 2.1/1.5, l2norm bwd 4.8/1.7, chunk fwd 37.4/36.4, chunk bwd 103.0/95.4",open (chunk backward 7.6 ms and l2norm backward 3.1 ms low)
+add,12.426,26.608,-14.182,yes,shared,residual adds,overcharged,open
+device memcpy,100.425,87.672,12.753,n/a,mixed,"host-to-device mask upload, pow clones",HtoD 64 MiB mask profiled low,open
+matmul/linear,597.337,584.696,12.641,yes,shared,projections and MLP,within 2%,open
+bmm,245.873,256.992,-11.119,yes,shared Megatron attention,attention,overcharged slightly,open
+silu_backward,14.063,4.416,9.647,no,SwiGLU / GDN gate,,,open
+pow,0.821,7.201,-6.380,yes,RMSNorm,,overcharged; real clone part is counted under device memcpy,open
+torch.compile region,5.705,0.000,5.705,n/a,GDN-specific + gated attention,"Megatron jit_fuser: _apply_gated_norm, _apply_output_gate","analysed QH-07t: real runs fuse these into Triton kernels (5.7 ms); simulation runs the same code eagerly and charges the individual ops (e.g. 64 extra silu events, 48 extra contiguous copies per step)","open (charged as eager-equivalent ops, not as fused kernels)"
+div,11.880,6.592,5.288,yes,shared,,,open
+_foreach_lerp_,3.002,0.000,3.002,no,optimizer (any AdamW run),,,open
+silu,7.017,4.032,2.985,no,SwiGLU / GDN gate,,,open
+_foreach_addcdiv_,3.952,1.067,2.885,yes,optimizer (any AdamW run),,,open
+sum,48.255,45.536,2.719,yes,shared,,,open
+embedding_backward,2.605,0.000,2.605,no,shared,,,open
+slice_backward,2.098,0.000,2.098,no,shared,,,open
+_foreach_sqrt,2.087,0.000,2.087,no,optimizer (any AdamW run),,,open
+_foreach_div_,2.050,0.000,2.050,no,optimizer (any AdamW run),,,open
+_foreach_add_,2.040,0.000,2.040,no,optimizer (any AdamW run),,,open
+_foreach_addcmul_,3.005,1.046,1.959,yes,optimizer (any AdamW run),,,open
+_foreach_mul_,4.020,2.098,1.922,yes,optimizer (any AdamW run),,,open
+linalg_vector_norm,1.683,0.000,1.683,no,optimizer / grad norm,,,open
+copy_,1.488,0.000,1.488,no,optimizer parameter copy (shared),,,open
+repeat_interleave,1.438,0.000,1.438,no,GDN-specific,_prepare_qkv head repetition,,open

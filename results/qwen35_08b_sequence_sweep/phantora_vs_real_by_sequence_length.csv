@@ -1,0 +1,8 @@
+sequence_length,tokens_per_step,real_ms,phantora_ms,difference_pct,shortfall_ms,real_prefetch_ms,difference_prefetch_pct,shortfall_prefetch_ms,real_peak_device_mib,phantora_peak_mib_unvalidated,strict_valid,missing_compute_keys,real_run_gpu01,phantora_run_gpu01,phantora_ms_layout_qh07v,difference_prefetch_pct_layout_qh07v,cat_contiguous_charged_ms_qh07v,phantora_run_layout_qh07v
+128,1024,897.536,96.515,-89.25,801.021,902.089,-89.30,805.574,,,false,14,/home/dathar/Phantora/qwen35-08b-tp2-20261114-EMj2SG,/home/dathar/Phantora/qh07d-gpu01-rNvEfL/discover-frtuj7n2,,,,
+512,4096,894.290,,,,901.675,,,,,,,/home/dathar/Phantora/qh07j-seqsweep-MfDAqY/seq-512,,,,,
+2048,16384,915.420,,,,873.778,,,,,,,/home/dathar/Phantora/qh07j-seqsweep-MfDAqY/seq-2048,,,,,
+4096,32768,1357.420,1018.278,-24.98,339.142,1317.488,-22.71,299.210,24196,16687,false,14,/home/dathar/Phantora/qh07l-longseq-zTevfm/seq-4096,/home/dathar/Phantora/qh07o-seq4096-wXFwuQ/replay/discover-jt57yhh2,,,,
+8192,65536,3191.606,2540.430,-20.40,651.176,3030.833,-16.18,490.403,41534,32465,false,14,/home/dathar/Phantora/qh07l-longseq-zTevfm/seq-8192,/home/dathar/Phantora/qh07m-seq8192-fGizjn/replay/discover-5trw483_,2651.694,-12.51,111.26,/home/dathar/Phantora/qh07u-layout-IxfR7j/replay-layout
+16384,131072,9074.697,7410.806,-18.34,1663.891,8444.144,-12.24,1033.338,95614,78746,false,14,/home/dathar/Phantora/qh07l-longseq-zTevfm/seq-16384,/home/dathar/Phantora/qh07n-seq16384-wUjCQk/replay/discover-recnhg2e,7660.502,-9.28,249.70,/home/dathar/Phantora/qh07v-points-aQv4GH/24-16384
+32768,262144,OOM,,,,,,,,,,,/home/dathar/Phantora/qh07l-longseq-zTevfm/seq-32768,,,,,

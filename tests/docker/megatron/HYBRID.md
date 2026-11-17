@@ -107,7 +107,7 @@ At 8192 the partial replay is 20.4% below real after measuring 161 compute,
 still missing and strict validation remains open. The difference flattens
 rather than falling linearly: for 4096–16384 the shortfall is close to
 0.13 s + 0.207 × replay time, which would level off near −17%. The CSV is in
-`results/qwen35_08b_sequence_sweep/` beside the repository.
+`results/qwen35_08b_sequence_sweep/` at the repository root.
 
 **Attribution at 8192 (2026-11-16):** A traced real step against a replay with
 per-event logging splits the 670 ms gap into 350 ms of GPU compute Phantora does

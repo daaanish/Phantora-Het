@@ -1,0 +1,5 @@
+configuration,phantora_ms,delta_vs_previous_ms,real_no_prefetch_ms,difference_no_prefetch_pct,real_prefetch_ms,difference_prefetch_pct,phantora_charged_compute_ms,real_gpu_compute_ms,remaining_compute_shortfall_ms,newly_charged_group_ms,real_ms_for_that_group
+"baseline (QH-07m DB, QH-07c build)",2540.430,,3191.606,-20.40,3030.833,-16.18,2260.0,2609.991,349.9,,
++ cat handler,2565.726,25.296,3191.606,-19.61,3030.833,-15.35,2285.3,2609.991,324.7,25.3,53.4
++ cat + contiguous handlers,2605.662,39.936,3191.606,-18.36,3030.833,-14.03,2325.3,2609.991,284.7,39.94,64.7
+"+ cat + contiguous handlers, traced layout (QH-07u)",2651.694,46.032,3191.606,-16.92,3030.833,-12.51,2371.3,2609.991,238.7,111.26,118.1

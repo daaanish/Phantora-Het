@@ -1,0 +1,41 @@
+Model family,Transformer layers,Order,Stage,Operation,Type,Simulator coverage,Real Megatron (ms per step),Phantora (ms per step),SimAI analytical (ms per step),SimAI ns-3 (ms per step),8 MiB comm estimate (ms per step),Notes
+Llama,32,0,Start,Clear gradient buffers,Compute,No explicit timing in either,,,,,,
+Llama,32,1,Microbatch,Input embedding,Compute,SimAI embedding row,,,0.648,0.649,,
+Llama,32,2,Microbatch,Token embedding all-reduce,Comm,"Phantora + SimAI, 4 calls per step",,,0.988,1.023,0.987,Estimate uses 271.916 Gbit/s and zero overlap.
+Llama,32,3,Microbatch,"Layers 1 to 32 forward, attention then MLP",Compute,Phantora + SimAI. SimAI groups block norms into these rows.,,,155.648,155.631,,
+Llama,32,4,Microbatch,Attention and MLP output all-reduces,Comm,"Phantora + SimAI, 256 calls per step",,,63.232,65.463,63.181,Two calls inside each layer. Estimate uses 271.916 Gbit/s and zero overlap.
+Llama,32,5,Microbatch,"Final norm, vocabulary projection, and loss",Compute,Phantora partial. No explicit SimAI compute row.,,,,,,
+Llama,32,6,Microbatch,Cross-entropy all-reduces,Comm,"Phantora 12 calls per step, SimAI 3",,,0.03,0.019,,4 KiB per call.
+Llama,32,7,Microbatch,Vocabulary projection backward,Compute,Phantora. No explicit SimAI compute row.,,,,,,
+Llama,32,8,Microbatch,Vocabulary input-gradient all-reduce,Comm,"Phantora, 4 calls per step",,,,,0.987,Estimate uses 271.916 Gbit/s and zero overlap.
+Llama,32,9,Microbatch,"Layers 32 to 1 backward, MLP then attention",Compute,Phantora partial. SimAI uses forward-derived compute proxies.,,,311.296,311.262,,
+Llama,32,10,Microbatch,MLP and QKV input-gradient all-reduces,Comm,"Phantora, 256 calls per step. SimAI omits them.",,,,,63.181,Two calls inside each layer. Estimate uses 271.916 Gbit/s and zero overlap.
+Llama,32,11,Microbatch,Embedding backward and local gradient accumulation,Compute,Phantora partial. SimAI has an embedding weight-gradient proxy.,,,9.62,9.62,,
+Llama,32,12,After accumulation,Extra layernorm all-reduce,Comm,"SimAI only, 1 call per step",,,163.752,165.127,,"5,565,841,408-byte payload."
+Llama,32,13,After accumulation,Extra embedding_grads all-reduce,Comm,"SimAI only, 1 call per step",,,0.247,0.256,,8 MiB payload.
+Llama,32,14,After accumulation,Prepare gradients,Compute,Phantora,14.669,13.765,,,,Instrumented phase timer.
+Llama,32,15,After accumulation,Optimizer scalar all-reduces,Comm,"Phantora 1 call per step, SimAI 4",,,0.04,0.026,,4 bytes per call.
+Llama,32,16,After accumulation,AdamW,Compute,Phantora partial. SimAI synthetic parameter compute.,182.77,72.549,15.626,15.626,,Real and Phantora values use instrumented AdamW phase timers.
+Llama,32,17,End,FP32 to BF16 weight copy,Compute,Neither models the conversion,13.458,0,,,,Instrumented phase timer. Phantora reported 0.000 ms.
+Llama,32,18,Summary,Forward and backward phase,Mixed,Instrumented phase totals,622.782,537.025,,,,Includes nested communication and timers.
+Llama,32,19,Summary,Full optimizer step,Mixed,Headline iteration averages,838.08,621.704,721.026,724.703,,Uninstrumented benchmark headline. Phase and communication rows can overlap.
+GPT,32,0,Start,Clear gradient buffers,Compute,No explicit timing in either,,,,,,
+GPT,32,1,Microbatch,Input embedding,Compute,SimAI embedding row,,,0.884,0.884,,
+GPT,32,2,Microbatch,Token embedding all-reduce,Comm,"Phantora + SimAI, 4 calls per step",,,0.988,1.023,0.987,Estimate uses 271.916 Gbit/s and zero overlap.
+GPT,32,3,Microbatch,"Layers 1 to 32 forward, attention then MLP",Compute,Phantora + SimAI. SimAI groups block norms into these rows.,,,131.456,131.498,,
+GPT,32,4,Microbatch,Attention and MLP output all-reduces,Comm,"Phantora + SimAI, 256 calls per step",,,63.232,65.463,63.181,Two calls inside each layer. Estimate uses 271.916 Gbit/s and zero overlap.
+GPT,32,5,Microbatch,"Final norm, vocabulary projection, and loss",Compute,Phantora partial. No explicit SimAI compute row.,,,,,,
+GPT,32,6,Microbatch,Cross-entropy all-reduces,Comm,"Phantora 12 calls per step, SimAI 3",,,0.03,0.019,,4 KiB per call.
+GPT,32,7,Microbatch,Vocabulary projection backward,Compute,Phantora. No explicit SimAI compute row.,,,,,,
+GPT,32,8,Microbatch,Vocabulary input-gradient all-reduce,Comm,"Phantora, 4 calls per step",,,,,0.987,Estimate uses 271.916 Gbit/s and zero overlap.
+GPT,32,9,Microbatch,"Layers 32 to 1 backward, MLP then attention",Compute,Phantora partial. SimAI uses forward-derived compute proxies.,,,262.912,262.996,,
+GPT,32,10,Microbatch,MLP and QKV input-gradient all-reduces,Comm,"Phantora, 256 calls per step. SimAI omits them.",,,,,63.181,Two calls inside each layer. Estimate uses 271.916 Gbit/s and zero overlap.
+GPT,32,11,Microbatch,Embedding backward and local gradient accumulation,Compute,Phantora partial. SimAI has an embedding weight-gradient proxy.,,,10.209,10.21,,
+GPT,32,12,After accumulation,Extra layernorm all-reduce,Comm,"SimAI only, 1 call per step",,,163.752,165.127,,"5,565,841,408-byte payload."
+GPT,32,13,After accumulation,Extra embedding_grads all-reduce,Comm,"SimAI only, 1 call per step",,,0.247,0.256,,8 MiB payload.
+GPT,32,14,After accumulation,Prepare gradients,Compute,Phantora,11.875,10.732,,,,Instrumented phase timer.
+GPT,32,15,After accumulation,Optimizer scalar all-reduces,Comm,"Phantora 1 call per step, SimAI 4",,,0.04,0.026,,4 bytes per call.
+GPT,32,16,After accumulation,AdamW,Compute,Phantora partial. SimAI synthetic parameter compute.,144.049,42.691,16.634,16.634,,Real and Phantora values use instrumented AdamW phase timers.
+GPT,32,17,End,FP32 to BF16 weight copy,Compute,Neither models the conversion,10.792,0,,,,Instrumented phase timer. Phantora reported 0.000 ms.
+GPT,32,18,Summary,Forward and backward phase,Mixed,Instrumented phase totals,548.951,485.432,,,,Includes nested communication and timers.
+GPT,32,19,Summary,Full optimizer step,Mixed,Headline iteration averages,720.663,538.409,650.459,654.137,,Uninstrumented benchmark headline. Phase and communication rows can overlap.

@@ -1,0 +1,67 @@
+op_group,real_gpu_activities,real_gpu_ms,phantora_events,phantora_charged_ms,shortfall_ms,phantora_status,real_gpu_ms_rank1
+to (dtype conversion),4878,317.146,3310,196.610,120.536,modeled,316.656
+masked_fill,48,77.786,48,147.984,-70.198,modeled_compute,77.758
+contiguous,1056,64.656,0,0.000,64.656,unmapped_compute,63.801
+cat,816,53.447,0,0.000,53.447,unmapped_compute,52.221
+baddbmm,48,93.668,48,146.064,-52.396,modeled_compute,92.046
+sub_,24,43.728,0,0.000,43.728,unmapped_compute,43.687
+mul,7767,130.138,8744,92.040,38.098,modeled_compute,128.645
+add_,3000,42.890,1848,5.488,37.402,modeled_compute,42.882
+_softmax_backward_data,96,203.386,48,172.080,31.306,modeled_compute,203.360
+max,16,21.269,0,0.000,21.269,unmapped_compute,21.273
+"fused GDN (conv, l2norm, chunk)",3744,191.483,1152,176.976,14.507,modeled,188.641
+add,1872,12.426,3152,26.608,-14.182,modeled_compute,12.387
+device memcpy,932,100.425,996,87.672,12.753,modeled,100.369
+matmul/linear,2328,597.337,2328,584.696,12.641,modeled,580.007
+bmm,240,245.873,240,256.992,-11.119,modeled_compute,236.085
+silu_backward,272,14.063,336,4.416,9.647,modeled_compute,13.751
+pow,569,0.821,1265,7.201,-6.380,modeled_compute,0.805
+torch.compile region,352,5.705,0,0.000,5.705,,6.426
+div,592,11.880,656,6.592,5.288,modeled_compute,11.561
+_foreach_lerp_,21,3.002,0,0.000,3.002,unmapped_compute,3.001
+silu,272,7.017,336,4.032,2.985,modeled_compute,6.943
+_foreach_addcdiv_,22,3.952,2,1.067,2.885,modeled_compute,3.968
+sum,1552,48.255,1672,45.536,2.719,modeled_compute,47.498
+embedding_backward,168,2.605,0,0.000,2.605,unmapped_compute,2.534
+slice_backward,384,2.098,0,0.000,2.098,unmapped_compute,2.053
+_foreach_sqrt,21,2.087,0,0.000,2.087,unmapped_compute,2.087
+_foreach_div_,21,2.050,0,0.000,2.050,unmapped_compute,2.050
+_foreach_add_,21,2.040,0,0.000,2.040,unmapped_compute,2.040
+_foreach_addcmul_,22,3.005,2,1.046,1.959,modeled_compute,3.005
+_foreach_mul_,42,4.020,4,2.098,1.922,modeled_compute,4.019
+linalg_vector_norm,230,1.683,0,0.000,1.683,unmapped_compute,1.505
+copy_,230,1.488,0,0.000,1.488,unmapped_compute,1.479
+repeat_interleave,96,1.438,0,0.000,1.438,unmapped_compute,1.424
+div_,24,43.740,16,44.352,-0.612,modeled_compute,43.694
+device memset,945,0.605,0,0.000,0.605,,0.622
+sigmoid,144,0.237,192,0.720,-0.483,modeled_compute,0.236
+neg,480,0.957,480,0.480,0.477,modeled_compute,0.952
+zero_,1,0.449,0,0.000,0.449,unmapped_compute,0.446
+sigmoid_backward,144,0.225,192,0.672,-0.447,modeled_compute,0.217
+mean,568,5.340,632,5.048,0.292,modeled_compute,5.152
+cos,96,0.267,0,0.000,0.267,unmapped_compute,0.265
+rsqrt,568,0.872,632,0.632,0.240,modeled_compute,0.847
+sin,96,0.222,0,0.000,0.222,unmapped_compute,0.219
+masked_fill_,48,77.744,48,77.952,-0.208,modeled_compute,77.738
+softplus_backward,144,0.339,144,0.144,0.195,modeled_compute,0.337
+index_put_,40,0.195,0,0.000,0.195,unmapped_compute,0.173
+softmax,48,69.477,48,69.312,0.165,modeled_compute,69.490
+softplus,144,0.300,144,0.144,0.156,modeled_compute,0.298
+square,568,6.722,632,6.568,0.154,modeled_compute,6.607
+index_put,8,0.153,0,0.000,0.153,unmapped_compute,0.120
+index,16,0.112,0,0.000,0.112,unmapped_compute,0.112
+mul_,24,44.373,16,44.288,0.085,modeled_compute,44.363
+embedding,8,0.073,0,0.000,0.073,unmapped_compute,0.055
+sub,24,0.036,0,0.000,0.036,unmapped_compute,0.036
+lt,16,0.029,0,0.000,0.029,unmapped_compute,0.028
+exp,160,44.560,152,44.536,0.024,modeled_compute,44.578
+__or__,16,0.022,0,0.000,0.022,unmapped_compute,0.022
+ge,16,0.022,0,0.000,0.022,unmapped_compute,0.022
+arange,16,0.016,0,0.000,0.016,unmapped_device_only,0.016
+log,8,0.013,0,0.000,0.013,unmapped_compute,0.012
+rsub,8,0.010,0,0.000,0.010,unmapped_compute,0.010
+ones_like,8,0.009,0,0.000,0.009,unmapped_compute,0.009
+flatten_dense_tensors,1,0.002,0,0.000,0.002,unmapped_compute,0.002
+zeros,2,0.002,0,0.000,0.002,unmapped_device_only,0.002
+no ATen op: <no op>,1,0.001,0,0.000,0.001,,0.000
+dropout,0,0.000,440,0.000,0.000,modeled_compute,0.000
