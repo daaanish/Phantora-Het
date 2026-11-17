@@ -4,13 +4,18 @@ These configurations describe workloads, not validated runtime support or timing
 Layer indices are zero-based global indices, including after pipeline partitioning.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 QWEN35_CONFIG_REVISION = "c202236235762e1c871ad0ccb60c8ee5ba337b9a"
 QWEN35_CONFIG_SOURCE = (
     "https://huggingface.co/Qwen/Qwen3.5-9B/resolve/"
     f"{QWEN35_CONFIG_REVISION}/config.json"
+)
+
+QWEN35_08B_CONFIG_SOURCE = (
+    "https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/"
+    "2fc06364715b967f1860aea9cf38778875588b17/config.json"
 )
 
 
@@ -37,6 +42,7 @@ class ModelSpec:
     partial_rotary_factor: float = 0.25
     rms_norm_eps: float = 1e-6
     rotary_base: float = 10000000.0
+    tie_word_embeddings: bool = False
 
     def __post_init__(self):
         for name in (
@@ -80,6 +86,26 @@ QWEN35_9B = ModelSpec(
     num_query_groups=4, head_dim=256, linear_num_key_heads=16,
     linear_num_value_heads=32, linear_key_head_dim=128, linear_value_head_dim=128,
 )
+
+
+QWEN35_08B = ModelSpec(
+    name="qwen3.5-0.8b-text", num_layers=24, hidden_size=1024,
+    ffn_hidden_size=3584, vocab_size=248320, num_attention_heads=8,
+    num_query_groups=2, head_dim=256, linear_num_key_heads=16,
+    linear_num_value_heads=16, linear_key_head_dim=128, linear_value_head_dim=128,
+    tie_word_embeddings=True,
+)
+
+# Reduced-depth timing fixture: 0.8B layer shapes, one 3 GDN + 1 full-attention group.
+# It is not a released Qwen checkpoint; use it to fit longer sequences in memory.
+QWEN35_08B_L4 = replace(QWEN35_08B, name="qwen3.5-0.8b-text-4layer", num_layers=4)
+
+HYBRID_PRESETS = {"debug": DEBUG_MODEL, "0.8b": QWEN35_08B, "0.8b-l4": QWEN35_08B_L4, "9b": QWEN35_9B}
+HYBRID_CONFIG_SOURCES = {
+    QWEN35_08B: QWEN35_08B_CONFIG_SOURCE,
+    QWEN35_08B_L4: f"{QWEN35_08B_CONFIG_SOURCE}; depth reduced from 24 to 4 layers",
+    QWEN35_9B: QWEN35_CONFIG_SOURCE,
+}
 
 
 @dataclass(frozen=True)
@@ -154,7 +180,7 @@ class HybridConfig:
 
 def configure_hybrid_args(args, argv, world_size):
     """Apply an explicit preset while rejecting conflicting architectural flags."""
-    model = {"debug": DEBUG_MODEL, "9b": QWEN35_9B}[args.hybrid_preset]
+    model = HYBRID_PRESETS[args.hybrid_preset]
     supplied = {arg.split("=", 1)[0] for arg in argv if arg.startswith("--")}
     fixed = dict(
         num_layers=model.num_layers, hidden_size=model.hidden_size,

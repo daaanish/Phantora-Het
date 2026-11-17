@@ -3,7 +3,7 @@
 import unittest
 from dataclasses import replace
 
-from qwen_hybrid_config import DEBUG_MODEL, QWEN35_9B, HybridConfig
+from qwen_hybrid_config import DEBUG_MODEL, HYBRID_PRESETS, QWEN35_9B, HybridConfig
 
 
 class HybridConfigTests(unittest.TestCase):
@@ -14,6 +14,29 @@ class HybridConfigTests(unittest.TestCase):
         self.assertEqual(config.model.head_dim, 256)
         self.assertEqual(config.model.linear_key_head_dim, 128)
         self.assertEqual(config.model.linear_value_head_dim, 128)
+
+    def test_08b_preset_supports_two_tensor_shards_with_tied_embeddings(self):
+        model = HYBRID_PRESETS["0.8b"]
+        config = HybridConfig(model=model, tensor_parallel_size=2, world_size=2)
+        self.assertEqual(config.pipeline_layers(0), tuple(enumerate(
+            ("gdn", "gdn", "gdn", "full_attention") * 6,
+        )))
+        self.assertEqual((model.hidden_size, model.ffn_hidden_size, model.vocab_size), (1024, 3584, 248320))
+        self.assertEqual((model.num_attention_heads, model.num_query_groups, model.head_dim), (8, 2, 256))
+        self.assertEqual((model.linear_num_key_heads, model.linear_num_value_heads,
+                          model.linear_key_head_dim, model.linear_value_head_dim), (16, 16, 128, 128))
+        self.assertTrue(model.tie_word_embeddings)
+        self.assertFalse(DEBUG_MODEL.tie_word_embeddings)
+        self.assertFalse(QWEN35_9B.tie_word_embeddings)
+
+    def test_08b_four_layer_preset_keeps_layer_shapes(self):
+        from dataclasses import replace
+        full, short = HYBRID_PRESETS["0.8b"], HYBRID_PRESETS["0.8b-l4"]
+        self.assertEqual(replace(short, name=full.name, num_layers=full.num_layers), full)
+        config = HybridConfig(model=short, tensor_parallel_size=2, world_size=2)
+        self.assertEqual(config.pipeline_layers(0), tuple(enumerate(
+            ("gdn", "gdn", "gdn", "full_attention"),
+        )))
 
     def test_global_pattern_and_crossing_pipeline_boundary(self):
         config = HybridConfig(model=replace(DEBUG_MODEL, num_layers=12), pipeline_parallel_size=2, world_size=2)

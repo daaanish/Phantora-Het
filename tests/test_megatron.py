@@ -2,6 +2,7 @@ from phantora_utils import (
     time_pair,
     enable_function_tracer,
     disable_function_tracer,
+    get_phantora_metadata_process_group,
     install_phantora_megatron_moe_patches,
 )
 import os
@@ -10,6 +11,7 @@ if os.environ.get("PHANTORA") is not None and any(arg.split("=", 1)[0] == "--hyb
     from qwen_hybrid_kernels import install_simulation_kernels
     install_simulation_kernels()
 import functools
+from unittest.mock import patch
 import torch
 from torch.utils.data import DataLoader
 from megatron.core import parallel_state
@@ -17,7 +19,10 @@ from megatron.core.datasets.blended_megatron_dataset_builder import (
     BlendedMegatronDatasetBuilder,
 )
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
-from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
+try:
+    from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
+except ImportError:
+    from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer as MegatronTokenizer
 from megatron.core.distributed import (
     DistributedDataParallelConfig as DDPConfig,
     DistributedDataParallel as DDP,
@@ -185,7 +190,7 @@ def get_model(
             position_embedding_type=position_embedding_type,
             rotary_base=rotary_base,
             **(dict(rotary_percent=hybrid_config.model.partial_rotary_factor,
-                    share_embeddings_and_output_weights=False) if hybrid_config is not None else {}),
+                    share_embeddings_and_output_weights=hybrid_config.model.tie_word_embeddings) if hybrid_config is not None else {}),
             pre_process=parallel_state.is_pipeline_first_stage(
                 ignore_virtual=False, vp_stage=vp_stage
             ),
@@ -232,9 +237,19 @@ def get_optimizer(model):
     )
 
     model_chunks = model if isinstance(model, list) else [model]
-    optim = get_megatron_optimizer(optim_config, model_chunks, use_gloo_process_groups=False)
+    if os.environ.get("PHANTORA") is None:
+        return get_megatron_optimizer(optim_config, model_chunks, use_gloo_process_groups=False)
 
-    return optim
+    all_gather_object = torch.distributed.all_gather_object
+
+    def gather_optimizer_metadata(object_list, obj, group=None):
+        # Core 0.16 exchanges parameter-group keys, which need real payloads.
+        if group is None:
+            group = get_phantora_metadata_process_group()
+        return all_gather_object(object_list, obj, group=group)
+
+    with patch.object(torch.distributed, "all_gather_object", gather_optimizer_metadata):
+        return get_megatron_optimizer(optim_config, model_chunks, use_gloo_process_groups=False)
 
 
 def iter_model_chunks(model):
@@ -256,6 +271,11 @@ def get_train_data_iterator(vocab_size, micro_batch_size, sequence_length):
     ).build()
     train_dataloader = DataLoader(datasets[0], batch_size=micro_batch_size)
     return iter(train_dataloader)
+
+
+def prefetch_batches(data_iterator, count):
+    """Materialize one step's host batches so dataset work stays outside the timed region."""
+    return iter([next(data_iterator) for _ in range(count)])
 
 
 def forward_step_func(device, data_iterator, model):
@@ -303,6 +323,7 @@ def main(
     kv_channels=None,
     qk_layernorm=False,
     hybrid_config=None,
+    prefetch=True,
 ):
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
@@ -419,13 +440,13 @@ def main(
     if hybrid_config is not None:
         import json
         from dataclasses import asdict
-        from qwen_hybrid_config import QWEN35_CONFIG_SOURCE, QWEN35_9B
+        from qwen_hybrid_config import HYBRID_CONFIG_SOURCES
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         print("HYBRID_CONFIG " + json.dumps(dict(
             rank=rank, pp_rank=pp_rank, workload=asdict(hybrid_config),
             layers=hybrid_config.pipeline_layers(pp_rank),
             tokens_per_iteration=hybrid_config.tokens_per_iteration,
-            source=QWEN35_CONFIG_SOURCE if hybrid_config.model == QWEN35_9B else "synthetic debug dimensions",
+            source=HYBRID_CONFIG_SOURCES.get(hybrid_config.model, "synthetic debug dimensions"),
             memory_validated=False,
             full_attention_backend="local_unfused",
         ), sort_keys=True), flush=True)
@@ -446,6 +467,13 @@ def main(
                 get_train_data_iterator(vocab_size, micro_batch_size, sequence_length)
                 for _ in range(virtual_pipeline_model_parallel_size)
             ]
+        if prefetch:
+            # The mock dataset builds each sample (including a seq x seq mask) on the host.
+            # Fetching inside the step leaves the GPU idle at the start of every step.
+            if isinstance(train_iterator, list):
+                train_iterator = [prefetch_batches(it, num_microbatches) for it in train_iterator]
+            else:
+                train_iterator = prefetch_batches(train_iterator, num_microbatches)
         start, start_wall = time_pair()
         for model_chunk in iter_model_chunks(model):
             model_chunk.zero_grad_buffer()
@@ -509,9 +537,10 @@ def main(
 
 if __name__ == "__main__":
     import argparse
+    from qwen_hybrid_config import HYBRID_PRESETS
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hybrid-preset", choices=["debug", "9b"], default=None)
+    parser.add_argument("--hybrid-preset", choices=HYBRID_PRESETS, default=None)
     parser.add_argument("--global_batch_size", type=int, default=None)
     parser.add_argument("--data_parallel_size", type=int, default=None)
     parser.add_argument("--tensor_parallel_size", type=int, default=4)
@@ -529,6 +558,8 @@ if __name__ == "__main__":
     parser.add_argument("--gradient_accumulation", type=int, default=1)
     parser.add_argument("--recompute_activations", action="store_true")
     parser.add_argument("--iterations", type=int, default=4)
+    parser.add_argument("--no_prefetch_batches", action="store_true",
+        help="Fetch each microbatch inside the timed step (previous behavior).")
     # Architectural knobs (names mirror Megatron's TransformerConfig / GPTModel fields).
     parser.add_argument("--swiglu", action="store_true",
         help="Use SwiGLU gated MLP (Megatron's `gated_linear_unit=True`).")
@@ -593,5 +624,6 @@ if __name__ == "__main__":
         kv_channels=args.kv_channels,
         qk_layernorm=args.qk_layernorm,
         hybrid_config=hybrid_config,
+        prefetch=not args.no_prefetch_batches,
     )
     disable_function_tracer()
