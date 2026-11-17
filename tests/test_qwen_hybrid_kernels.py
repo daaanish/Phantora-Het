@@ -117,6 +117,18 @@ class KernelAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "higher-order"):
             torch.autograd.grad(output.sum(), x, create_graph=True)
 
+    def test_contiguous_filter_skips_only_calls_that_would_not_copy(self):
+        kernels.install_contiguous_filter()
+        kernels.install_contiguous_filter()
+        value = torch.arange(6.0).view(2, 3)
+        self.assertIs(value.contiguous(), value)
+        strided = value.t()
+        copied = strided.contiguous()
+        self.assertIsNot(copied, strided)
+        self.assertTrue(copied.is_contiguous())
+        torch.testing.assert_close(copied, strided)
+        self.assertTrue(value.contiguous(memory_format=torch.contiguous_format).is_contiguous())
+
     def test_installer_preserves_namespaces_repairs_aliases_and_imports_no_kernels(self):
         existing = ModuleType("fla")
         existing.unrelated = object()

@@ -204,8 +204,47 @@ fn qwen_call(op: &str, args: &[TorchValue]) -> Option<TorchCallInfo> {
     let tensor = |value: &TorchValue| match value {
         Tensor(shape, kind, _) => Some(TensorInfo { shape: shape.clone(), dtype: *kind }), _ => None,
     };
+    let mut key_op = op;
     match (op, args) {
-        ("exp" | "neg" | "sigmoid" | "silu" | "rsqrt", [x]) => inputs.push(tensor(x)?),
+        ("exp", [
+            x @ Tensor(shape, kind, tch::Device::Cuda(device)),
+            out @ Tensor(out_shape, out_kind, tch::Device::Cuda(out_device)),
+        ])
+            if shape == out_shape && kind == out_kind && device == out_device
+                && matches!(kind, tch::Kind::Float | tch::Kind::Half | tch::Kind::BFloat16 | tch::Kind::Double) =>
+        {
+            inputs.extend([tensor(x)?, tensor(out)?]);
+            key_op = "exp_out";
+        }
+        ("exp" | "neg" | "sigmoid" | "silu" | "rsqrt" | "square", [x]) => inputs.push(tensor(x)?),
+        // Concatenation always copies. Members keep their order; the axis is normalized.
+        ("cat", [List(values), Int(dim)]) => {
+            let (kind, device) = match values.first() {
+                Some(Tensor(_, kind, tch::Device::Cuda(device))) => (*kind, *device), _ => return None,
+            };
+            if !matches!(kind, tch::Kind::Float | tch::Kind::Half | tch::Kind::BFloat16 | tch::Kind::Double) { return None; }
+            for value in values {
+                match value {
+                    Tensor(shape, k, tch::Device::Cuda(d)) if *k == kind && *d == device && !shape.is_empty() => {
+                        inputs.push(tensor(value)?);
+                    }
+                    _ => return None,
+                }
+            }
+            let rank = inputs[0].shape.len() as i64;
+            let dim = if *dim < 0 { *dim + rank } else { *dim };
+            if dim < 0 || dim >= rank || inputs.iter().any(|input| input.shape.len() as i64 != rank) { return None; }
+            dims.push(dim);
+        }
+        // Only calls that really copy reach the tracer: the simulation wrapper returns
+        // already-contiguous tensors unchanged. The trace has no strides, so the key is
+        // shape and dtype and the profiler replays a strided source.
+        ("contiguous", [x @ Tensor(shape, kind, tch::Device::Cuda(_)), Int(0)])
+            if shape.len() >= 2
+                && matches!(kind, tch::Kind::Float | tch::Kind::Half | tch::Kind::BFloat16 | tch::Kind::Double) =>
+        {
+            inputs.push(tensor(x)?);
+        }
         ("sigmoid_backward" | "silu_backward", [grad, x]) => {
             inputs.extend([tensor(grad)?, tensor(x)?]);
         }
@@ -253,7 +292,7 @@ fn qwen_call(op: &str, args: &[TorchValue]) -> Option<TorchCallInfo> {
         }
         _ => return None,
     }
-    Some(TorchCallInfo::QwenOp { op: op.into(), inputs, scalars, dims, keepdim, dtype })
+    Some(TorchCallInfo::QwenOp { op: key_op.into(), inputs, scalars, dims, keepdim, dtype })
 }
 
 impl TorchCallMsg {
@@ -536,9 +575,9 @@ impl TorchCallMsg {
                 })),
                 _ => None,
             },
-            "aten::exp" | "aten::neg" | "aten::div_" | "aten::sigmoid" | "aten::silu" | "aten::rsqrt"
+            "aten::exp" | "aten::neg" | "aten::div_" | "aten::sigmoid" | "aten::silu" | "aten::rsqrt" | "aten::square"
             | "aten::softplus" | "aten::mean" | "aten::sigmoid_backward"
-            | "aten::silu_backward" | "aten::softplus_backward" if hybrid => {
+            | "aten::silu_backward" | "aten::softplus_backward" | "aten::cat" | "aten::contiguous" if hybrid => {
                 qwen_call(self.name.trim_start_matches("aten::"), &self.args)
             }
             "aten::addcmul_" => match self.args.as_slice() {
@@ -1238,6 +1277,67 @@ mod hybrid_tests {
             TorchCallInfo::Pow(_)));
         assert!(matches!(message("aten::pow", vec![tensor(), TorchValue::Int(3)]).into_hybrid_call(0).unwrap().info,
             TorchCallInfo::QwenOp { scalars, .. } if scalars == vec![3f64.to_bits()]));
+    }
+
+    #[test]
+    fn qwen_square_and_exp_overloads_keep_distinct_opt_in_keys() {
+        for (name, arity, expected) in [
+            ("aten::square", 1, "square"),
+            ("aten::exp", 1, "exp"),
+            ("aten::exp", 2, "exp_out"),
+        ] {
+            let args = || (0..arity).map(|_| tensor()).collect();
+            assert!(message(name, args()).into_call(0).is_none());
+            assert!(matches!(
+                message(name, args()).into_hybrid_call(0).unwrap().info,
+                TorchCallInfo::QwenOp { op, inputs, .. } if op == expected && inputs.len() == arity
+            ));
+        }
+        for out in [
+            TorchValue::Bool(false),
+            TorchValue::Tensor(vec![3, 2], tch::Kind::Float, tch::Device::Cuda(0)),
+            TorchValue::Tensor(vec![2, 3], tch::Kind::Double, tch::Device::Cuda(0)),
+            TorchValue::Tensor(vec![2, 3], tch::Kind::Float, tch::Device::Cuda(1)),
+        ] {
+            let (call, recognized) = message("aten::exp", vec![tensor(), out]).into_hybrid_classified_call(0);
+            assert!(recognized && call.is_none());
+        }
+        assert!(message("aten::square", vec![tensor(), tensor()]).into_hybrid_call(0).is_none());
+    }
+
+    #[test]
+    fn qwen_cat_and_contiguous_are_opt_in_copies() {
+        let cuda = |shape: Vec<i64>, kind| TorchValue::Tensor(shape, kind, tch::Device::Cuda(0));
+        let list = || TorchValue::List(vec![cuda(vec![2, 3], tch::Kind::Float), cuda(vec![2, 5], tch::Kind::Float)]);
+        assert!(message("aten::cat", vec![list(), TorchValue::Int(-1)]).into_call(0).is_none());
+        assert!(matches!(
+            message("aten::cat", vec![list(), TorchValue::Int(-1)]).into_hybrid_call(0).unwrap().info,
+            TorchCallInfo::QwenOp { op, inputs, dims, .. }
+                if op == "cat" && inputs.len() == 2 && inputs[1].shape == vec![2, 5] && dims == vec![1]
+        ));
+        for bad in [
+            vec![TorchValue::List(vec![]), TorchValue::Int(0)],
+            vec![TorchValue::List(vec![tensor(), cuda(vec![2, 3], tch::Kind::Double)]), TorchValue::Int(0)],
+            vec![TorchValue::List(vec![tensor(), TorchValue::Bool(true)]), TorchValue::Int(0)],
+            vec![list(), TorchValue::Int(2)],
+            vec![list()],
+        ] {
+            let (call, recognized) = message("aten::cat", bad).into_hybrid_classified_call(0);
+            assert!(recognized && call.is_none());
+        }
+        assert!(message("aten::contiguous", vec![tensor(), TorchValue::Int(0)]).into_call(0).is_none());
+        assert!(matches!(
+            message("aten::contiguous", vec![tensor(), TorchValue::Int(0)]).into_hybrid_call(0).unwrap().info,
+            TorchCallInfo::QwenOp { op, inputs, .. } if op == "contiguous" && inputs.len() == 1
+        ));
+        for bad in [
+            vec![tensor(), TorchValue::Int(2)],
+            vec![cuda(vec![6], tch::Kind::Float), TorchValue::Int(0)],
+            vec![cuda(vec![2, 3], tch::Kind::Int64), TorchValue::Int(0)],
+        ] {
+            let (call, recognized) = message("aten::contiguous", bad).into_hybrid_classified_call(0);
+            assert!(recognized && call.is_none());
+        }
     }
 
     #[test]

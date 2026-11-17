@@ -132,6 +132,25 @@ class KernelAdapters:
 
 
 _ADAPTERS = None
+_CONTIGUOUS = None
+
+
+def install_contiguous_filter():
+    """Keep no-op contiguous() calls away from the tracer, which cannot see strides.
+
+    PyTorch returns the same tensor when it is already contiguous; doing that check
+    here means every aten::contiguous the simulator receives is a real copy.
+    """
+    global _CONTIGUOUS
+    if _CONTIGUOUS is None:
+        _CONTIGUOUS = torch.Tensor.contiguous
+
+        def contiguous(self, *args, **kwargs):
+            if not args and not kwargs and self.is_contiguous():
+                return self
+            return _CONTIGUOUS(self, *args, **kwargs)
+
+        torch.Tensor.contiguous = contiguous
 
 
 def install_simulation_kernels(sink=None):
@@ -166,4 +185,5 @@ def install_simulation_kernels(sink=None):
         captured.chunk_gated_delta_rule = _ADAPTERS.chunk_gated_delta_rule
         captured.causal_conv1d_fn = _ADAPTERS.causal_conv1d_fn
         captured.HAVE_FLA = True
+    install_contiguous_filter()
     return _ADAPTERS

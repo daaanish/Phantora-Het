@@ -32,6 +32,43 @@ class QwenOpTests(unittest.TestCase):
         self.assertIs(actual, value)
         torch.testing.assert_close(actual, torch.full((2, 3), 0.25))
 
+    def test_square_and_exp_out_replay_the_distinct_aten_calls(self):
+        value = torch.linspace(-1, 1, 6).view(2, 3)
+        original = value.clone()
+        allocate = lambda info: value
+        torch.testing.assert_close(build(self.payload("square"), allocator=allocate)(), original.square())
+        torch.testing.assert_close(build(self.payload("exp"), allocator=allocate)(), original.exp())
+        torch.testing.assert_close(value, original)
+        payload = self.payload("exp_out")
+        payload["inputs"] *= 2
+        result = build(payload, allocator=allocate)()
+        self.assertIs(result, value)
+        torch.testing.assert_close(value, original.exp())
+
+    def test_cat_reads_distinct_members_and_contiguous_copies_a_strided_source(self):
+        value = torch.arange(6, dtype=torch.float32).view(2, 3)
+        payload = self.payload("cat", dims=[1])
+        payload["inputs"] *= 2
+        actual = build(payload, allocator=lambda info: value)()
+        torch.testing.assert_close(actual, torch.cat([value, value], 1))
+        payload = self.payload("contiguous")
+        calls = []
+        original = torch.Tensor.contiguous
+
+        def spy(tensor, *args, **kwargs):
+            calls.append(tensor.is_contiguous())
+            return original(tensor, *args, **kwargs)
+
+        thunk = build(payload, allocator=lambda info: value)
+        torch.Tensor.contiguous = spy
+        try:
+            result = thunk()
+        finally:
+            torch.Tensor.contiguous = original
+        self.assertEqual(calls, [False])
+        self.assertEqual(tuple(result.shape), (2, 3))
+        self.assertTrue(result.is_contiguous())
+
     def test_gate_forward_and_backward_dispatch(self):
         value = torch.ones(2, 3)
         for name in ("exp", "neg", "sigmoid", "silu", "rsqrt", "softplus"):

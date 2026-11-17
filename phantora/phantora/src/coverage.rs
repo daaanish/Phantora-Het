@@ -305,9 +305,13 @@ mod tests {
         run.torch(&host(1), "aten::empty_strided", "device-only allocation", false, false);
         run.torch(&host(1), "aten::exp", "float tensor", true, true);
         assert!(run.errors.is_empty());
+        // A copy the parser did not model stays an error; a modeled one does not.
         run.torch(&host(1), "aten::contiguous", "copy", false, false);
         run.torch(&host(1), "aten::zeros", "device-only compute", false, false);
         assert_eq!(run.errors.len(), 2);
+        run.torch(&host(1), "aten::contiguous", "modeled copy", true, true);
+        assert_eq!(run.errors.len(), 2);
+        assert_eq!(run.categories["modeled_compute"]["aten::contiguous"].count, 1);
         assert_eq!(run.outside_region, 1);
         run.torch(&host(1), "aten::exp", "bad arguments", false, true);
         assert_eq!(run.categories["malformed_compute"]["aten::exp"].count, 1);
