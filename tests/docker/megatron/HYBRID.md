@@ -1,13 +1,139 @@
 # Opt-in hybrid replay runner
 
-Prepared Linux command (native/runtime and GPU gates remain pending):
+## Migration record
+
+### 1. Original Phantora
+
+**Existed:** Megatron Core 0.13.1, patched PyTorch 2.9.1/CUDA 12.8, ATen and
+CUDA/NCCL interception, and timing DBs for recorded workloads. The two-rank
+Llama replay passed. **Limit:** No Qwen3.5 GDN timing events, and the original
+ATen parser had no dispatch case for any of the 39 compute names later reported
+as unmapped in 0.8B discovery (e.g. `embedding`, `clone`, `zero_`). That is
+source evidence of inherited parser gaps, not evidence Llama hit all 39.
+**Changed:** Nothing in the original checkout or default runtime.
+
+### 2. Megatron update: Core 0.13.1 → 0.16.0
+
+**Existed:** Same Phantora trainer, PyTorch patch and Llama replay workload.
+Core 0.16.0 was installed in a separate environment. The Llama control isolated
+what broke before adding GDN:
+
+| What broke | What changed |
+|---|---|
+| Trainer import: `datasets.megatron_tokenizer.MegatronTokenizer` was renamed. | Keep the 0.13.1 import; fall back to `MegatronLegacyTokenizer` on 0.16.0. |
+| Optimizer setup: `_get_param_groups` calls `all_gather_object`; simulated NCCL moves no payload, so unpickling raised `EOFError`. | Route the default-group object gather through CPU Gloo only during simulated optimizer construction. Real training and numerical NCCL traffic are unchanged. |
+| L40S timings: Core 0.16.0's unfused SwiGLU evaluates `x_linear + glu_linear_offset` even at zero offset. Llama TP2 missed `Add(BF16 [1024,1,7168], FP64 scalar)`. | Measure the new key on the target GPU. Both versions passed the same Llama replay with a fresh Blackwell DB. Keep L40S and Blackwell timings separate. |
+
+**Packaging:** The original gpu01 SIF reported `git_version='Unknown'` because
+its copied PyTorch submodule Git pointer was dangling. Rebuilt the pinned Torch
+wheel with verified Git metadata; the revision check stayed intact.
+
+### 3. Qwen3.5 GDN run
+
+**Existed:** Core 0.16.0 supplies GDN, but its stock hybrid builder requires
+Transformer Engine and the original Phantora trace does not time fused GDN
+kernels. **Changed:** Use Phantora's local hybrid spec, and add explicit forward
+and backward events for causal convolution, L2 norm and chunked GDN. Install
+`flash-linear-attention==0.4.0` and `fla-core==0.4.0` explicitly with `--no-deps`;
+build `causal-conv1d==1.5.3.post1` against the pinned Torch.
+
+**What broke on gpu01:** Triton 3.7.0's bundled Blackwell `ptxas` 13.1 produced
+`device kernel image is invalid` on driver 570.195.03. Set
+`TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda/bin/ptxas` (CUDA 12.8) inside
+Apptainer. Give contained replay a writable `HOME` for DeepSpeed imports.
+
+**Verified:** Real Qwen3.5-0.8B TP2 training passed. Phantora discovery finished
+both ranks with all expected GDN events. After measuring all six GDN timing keys,
+the partial replay estimated **0.095 s/step vs 0.898 s/step real**. It still omits
+operator work and CPU time, so strict timing acceptance remains open. See the
+[tracker](../../../QWEN_HYBRID_TRACKER.md) for the timing DB and remaining misses.
+
+## What to model next
+
+[Original Phantora](https://danyangzhuo.com/papers/NSDI26-Phantora.pdf) (§3–4)
+runs the framework's actual layer schedule and models device work at operation
+boundaries. Reuse the layer code, profile real GPU work once at each supported
+boundary, and preserve stream and communication ordering. This does not call
+for hand-written latency models for each layer or numerical tensor payloads.
+
+| Boundary in the 0.8B case | What exists and what remains |
+|---|---|
+| GDN layers (18) | All six fused forward/backward timings were measured and used, with the expected counts on both ranks. Their sum is **13.13 ms of charged fused work per rank per step**; this excludes projections, norms, MLPs and communication and is not an isolated wall-time contribution. The fused GDN triplet is not missing. |
+| Full-attention layers (6) and shared layer work | Megatron's local attention and projections already run; existing matmul and softmax times are reused. RMSNorm `square` is now recognized (5,056 calls); measure the four new keys. Device/layout `to`, rotary `sin`/`cos` and layout copies still need classification. Distinguish real copies from views; charge each once. |
+| Model-wide training | The recorded two-tensor `exp` out overload at the vocab-shard logits shape is now recognized (one key to measure). Embedding/backward, optimizer foreach and initialized factories expose inherited gaps; leave them visible and prioritize by measured cost. |
+| End-to-end comparison | Measuring the five newly recognized keys brought the missing compute count from 19 to 14. No copy or GDN timing misses. Real includes CPU time; replay excluded it and used a fixed measured network rate. CPU-on replay is a sensitivity check, not a measurement of real CPU time. |
+
+The five new FP32 keys are four `square` shapes (`[128,1,1024]` block/final
+RMSNorm, `[1024,128]` GDN head norm, `[128,1,4,256]` Q norm and
+`[128,1,1,256]` K norm) and `exp_out` at `[128,1,124160]` for the rank's
+vocabulary shard. `square` feeds each RMSNorm's mean-square reduction;
+`exp_out` exponentiates the cross-entropy logits in place. Profile these five
+on the same Blackwell and add them to a copy of the previous DB. Reuse the
+same workload, network and CPU-time settings to isolate their effect.
+
+**Result:** All five keys hit. The partial replay rose from **95.02 to 96.52
+ms/step** on the same native build; real training took **897.54 ms/step**.
+The added **1.50 ms/step** explains very little of the difference. Strict
+timing validation remains open.
+
+**Phase check (same Megatron timers as GPT/Llama):** Real/replay were
+**907.78/96.21 ms/step** with instrumentation. Forward/backward accounted for
+**857.91/90.71 ms**, about 95% of the gap; inner optimizer was **21.04/4.21 ms**.
+In a separate real CUDA trace, TP all-reduce kernels on rank 0 often waited for
+rank 1 to arrive (median start skew 0.696 ms, median finish skew 0.0005 ms).
+The trace added overhead; it localizes a rank-progress problem but does not tell
+us the unprofiled wait duration or its cause. CPU-on replay overshot at 3.33 s;
+it counts replay process CPU time, so it does not fix the comparison.
+
+**Cause (2026-11-16):** At sequence length 128 the real step is host-bound.
+Each rank issues about 36,000 GPU activities per step averaging 4 µs, about
+141 ms of GPU compute; on the pace-setting rank the GPU is empty with no launch
+pending for 73% of a traced step. The peer waits at TP all-reduces are the
+other rank's GPU parked in NCCL until the slower host arrives. Real step time
+is flat as tokens grow 16x, then tracks GPU work:
+
+| Sequence length (MB 1, GA 8) | Real s/step | Replay s/step | Difference | Peak device memory |
+|---|---:|---:|---:|---:|
+| 128 | 0.898 | 0.097 | −89.2% | ~9 GiB |
+| 512 | 0.894 | not run | | not recorded |
+| 2048 | 0.915 | not run | | not recorded |
+| 4096 | 1.357 | 1.018 | −25.0% | 24 GiB |
+| 8192 | 3.192 | 2.540 | −20.4% | 42 GiB |
+| 16384 | 9.075 | 7.411 | −18.3% | 95.6 of 97.9 GiB |
+| 32768 | OOM | not run | | — |
+
+At 8192 the partial replay is 20.4% below real after measuring 161 compute,
+7 copy and 6 fused keys at the new shapes, and at 16384 it is 18.3% below; 14 zero-activity compute keys are
+still missing and strict validation remains open. The difference flattens
+rather than falling linearly: for 4096–16384 the shortfall is close to
+0.13 s + 0.207 × replay time, which would level off near −17%. The CSV is in
+`results/qwen35_08b_sequence_sweep/` beside the repository.
+
+**Attribution at 8192 (2026-11-16):** A traced real step against a replay with
+per-event logging splits the 670 ms gap into 350 ms of GPU compute Phantora does
+not charge, 269 ms with the GPU empty between kernels, and 51 ms of all-reduce.
+The compute part is 203 ms of unmapped operations (`contiguous`, `cat`, `sub_`,
+`max`, `_foreach_*`), 121 ms of `aten::to` conversions in a call form the parser
+rejects, and 176 ms of charged operations that come out low, less 156 ms that
+come out high (`masked_fill` is charged once with its clone and again for the
+intercepted memcpy). The 14 zero-activity keys contribute almost nothing.
+
+**Batch prefetching (2026-11-16):** the trainer now fetches a step's batches
+before the timer starts (`--no_prefetch_batches` restores the old path), which
+removes a host stall at the start of every real step. Replay times do not
+change. Against prefetch real times the replay is 22.7% low at 4096, 16.2% at
+8192 and 12.2% at 16384; the table above keeps the earlier no-prefetch values. Use 8192 as the 0.8B timing
+comparison point. A GPU-work replay with CPU time ignored cannot predict the
+128 case; measuring more keys there will not close it.
+
+## Docker replay
 
 First run the existing Llama baseline on the original/default image with the
 exact recorded replay configuration in the repository README. For example, the
 existing preset entry point is `tests/docker/megatron/llama/run_llama3_8b.sh` after
 `tests/docker/megatron/config_gen.py` has generated its matching configuration.
-This baseline gate remains pending here; do not substitute a successful hybrid
-CPU test for it. Then build the separate hybrid image:
+The Docker baseline remains pending; the `gpu01` compatibility result used
+Apptainer. Then build the separate hybrid image:
 
 ```bash
 docker build --target phantora-hybrid -t phantora:hybrid .

@@ -45,9 +45,11 @@ CPU tests distinguish this rounding behavior. They do not validate the complete
 initialized Megatron model or real fused CUDA execution.
 
 The offline fused profiler is `tests/perfdb/gdn_profile.py`. It requires the exact
-patched torch revision, torch 2.9.1 built with CUDA **12.8**, Triton 3.7.0, FLA
-0.4.0 and causal-conv1d 1.5.3.post1, plus the actual GPU name. Provenance includes
-`cuda`. The candidate combination still needs its Linux import and kernel gates.
+patched torch revision, torch 2.9.1 built with CUDA **12.8**, Triton 3.7.0,
+`flash-linear-attention` and `fla-core` both at 0.4.0, and causal-conv1d
+1.5.3.post1, plus the actual GPU name. Provenance records `cuda` and uses the
+`fla-core` distribution version for `fla`. The candidate combination still needs
+its Linux import and kernel gates.
 Run without PHANTORA, LD_PRELOAD or simulation aliases; stub libraries are rejected.
 
 ```bash
