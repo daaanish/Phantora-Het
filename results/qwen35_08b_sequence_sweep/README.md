@@ -97,6 +97,25 @@ The two points closest to real, rerun with the `cat`/`contiguous` handlers and t
 - Per-op real times were only attributed at seq 8192, so how close the new charges are to real at these sizes is not measured.
 - Runs: `gpu01:/home/dathar/Phantora/qh07v-points-aQv4GH`.
 
+## With the MTP layer (QH-07w, 2026-11-17)
+
+Qwen3.5-0.8B ships one multi-token-prediction (MTP) layer (`mtp_num_hidden_layers: 1`): `fc` (2h → h) on the normed embedding and hidden state, one gated full-attention + SwiGLU layer, a final norm and the shared, tied LM head. Earlier runs trained without it. These runs add it with `--mtp 1` (commit `c8da175`; real runs at 16384 and 24576 on `e16e505`, which differs only by one tracker line). Everything else matches the earlier points: TP 2, micro-batch 1, accumulation 8, 4 iterations, the same network rate, real runs with batch prefetch. Each simulation starts from that point's latest DB; profiling added 25 MTP keys. New columns in both sweep CSVs end in `_mtp_qh07w`.
+
+| Point | Real, no MTP | Real, MTP | MTP cost, real | Phantora, no MTP | Phantora, MTP | MTP cost, Phantora | Diff, MTP |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 24 layers, seq 8192 | 3,030.8 ms | 3,795.7 ms | +764.9 ms (+25.2%) | 2,651.7 ms | 3,300.1 ms | +648.4 ms (84.8% of real) | −13.1% (was −12.5%) |
+| 4 layers, seq 24576 | 4,086.2 ms | 7,539.3 ms | +3,453.1 ms (+84.5%) | 3,843.5 ms | 7,054.1 ms | +3,210.5 ms (93.0% of real) | −6.4% (was −5.9%) |
+| 24 layers, seq 16384 | 8,444.1 ms | out of memory | | 7,660.5 ms | out of memory | | |
+
+- **Control.** On the new commit without MTP, seq 8192 reproduces the QH-07u replay (2,651.694 ms discovery, 2,651.727 ms replay, 14 missing keys), so the code change alone moves nothing.
+- **MTP is built.** Both ranks pass the structure check with 24 decoder layers plus the MTP full-attention layer.
+- **Why 4 layers grows so much.** The 4-layer model has one full-attention layer; MTP adds a second. At seq 24576 the local attention backend's s² ops dominate, and each one doubles in the replay: `BMM` 437 → 874 ms, `SoftmaxBackward` 298 → 596, `BAddBMM` 233 → 465, `MaskedFill` 223 → 446 per rank-step. The second LM-head pass adds about 400 ms more (`MatMul`, `exp_out`, casts). Real time grows by a similar amount, so this is a real cost of MTP at long sequences, not a simulator artifact.
+- **Out of memory at seq 16384.** The real run and the simulation both fail on the same 7.58 GiB allocation (the MTP logits). Without MTP this point peaked at 95,614 of 97,887 MiB. The MTP real run reached 96,804 MiB before failing.
+- **Peak memory, real (simulated, unvalidated):** seq 8192 50,016 MiB (40,732), up from 41,534 (32,465); 4 layers, seq 24576 92,418 MiB (78,540), up from 59,796 (49,620).
+- **Still `valid=false`:** 15 keys missing, the same 14 as before plus `ConvDType bf16 [512,2048]`, the `eh_proj` weight cast. It profiles as non-positive, as expected for a cast to the dtype the weight already has, and is charged 0.
+- **Not measured:** real per-op times with MTP, so the 15% (seq 8192) and 7% (24576) of MTP cost that Phantora misses are not yet attributed.
+- Runs: `gpu01:/home/dathar/Phantora/runs/20261117-18{2254-ctrl-8192-nomtp,2508-mtp-8192,3343-mtp-l4-24576,3514-mtp-24-16384,3632-mtp-8192-real}-c8da1756` and `20261117-22{0104-mtp-l4-24576-real,0357-mtp-24-16384-real}-e16e505d`; drivers `runs/qh07w-mtp.sh` and `qh07w-mtp-real2.sh` (the first printed exit 0 for every step because of a `$?` bug; per-stage exits are in each run's `progress.log`, and two of its real runs were refused because upstream had moved, then rerun by the second).
+
 ## Missing-compute ledger
 
 [missing_compute_ledger.csv](missing_compute_ledger.csv) lists every operation

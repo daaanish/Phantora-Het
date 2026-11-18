@@ -1,10 +1,10 @@
-sequence_length,tokens_per_step,real_ms,phantora_ms,difference_pct,shortfall_ms,real_prefetch_ms,difference_prefetch_pct,shortfall_prefetch_ms,real_peak_device_mib,phantora_peak_mib_unvalidated,missing_compute_keys,notes,phantora_ms_layout_qh07v,difference_prefetch_pct_layout_qh07v,cat_contiguous_charged_ms_qh07v,phantora_run_layout_qh07v
-128,1024,184.368,29.699,-83.89,154.669,186.053,-84.04,156.354,8490,,14,,,,,
-1024,8192,187.073,92.789,-50.40,94.284,185.591,-50.00,92.802,8788,,14,,,,,
-2048,16384,273.172,169.219,-38.05,103.953,260.774,-35.11,91.555,9842,,14,,,,,
-4096,32768,494.541,350.612,-29.10,143.929,461.355,-24.00,110.743,12746,,14,,,,,
-8192,65536,1102.880,785.716,-28.76,317.164,942.808,-16.66,157.092,19212,,14,,,,,
-12288,98304,1921.773,1327.982,-30.90,593.791,1561.340,-14.95,233.358,27528,,14,,,,,
-16384,131072,2931.975,1987.492,-32.21,944.483,2291.456,-13.27,303.964,33790,26535,14,,,,,
-24576,196608,5520.709,3778.226,-31.56,1742.483,4086.193,-7.54,307.967,59796,49620,14,,3843.538,-5.94,65.31,/home/dathar/Phantora/qh07v-points-aQv4GH/l4-24576
-32768,262144,10164.137,5908.358,-41.87,4255.779,7608.697,-22.35,1700.339,96442,83904,14,Phantora simulated VRAM raised to 131072 MiB; real at memory limit; first real sample 10150.340 ms,,,,
+sequence_length,tokens_per_step,real_ms,phantora_ms,difference_pct,shortfall_ms,real_prefetch_ms,difference_prefetch_pct,shortfall_prefetch_ms,real_peak_device_mib,phantora_peak_mib_unvalidated,missing_compute_keys,notes,phantora_ms_layout_qh07v,difference_prefetch_pct_layout_qh07v,cat_contiguous_charged_ms_qh07v,phantora_run_layout_qh07v,real_prefetch_ms_mtp_qh07w,phantora_ms_mtp_qh07w,difference_pct_mtp_qh07w,mtp_cost_real_ms_qh07w,mtp_cost_phantora_ms_qh07w,real_peak_device_mib_mtp_qh07w,phantora_peak_mib_unvalidated_mtp_qh07w,missing_compute_keys_mtp_qh07w,real_run_mtp_qh07w,phantora_run_mtp_qh07w,notes_mtp_qh07w
+128,1024,184.368,29.699,-83.89,154.669,186.053,-84.04,156.354,8490,,14,,,,,,,,,,,,,,,,
+1024,8192,187.073,92.789,-50.40,94.284,185.591,-50.00,92.802,8788,,14,,,,,,,,,,,,,,,,
+2048,16384,273.172,169.219,-38.05,103.953,260.774,-35.11,91.555,9842,,14,,,,,,,,,,,,,,,,
+4096,32768,494.541,350.612,-29.10,143.929,461.355,-24.00,110.743,12746,,14,,,,,,,,,,,,,,,,
+8192,65536,1102.880,785.716,-28.76,317.164,942.808,-16.66,157.092,19212,,14,,,,,,,,,,,,,,,,
+12288,98304,1921.773,1327.982,-30.90,593.791,1561.340,-14.95,233.358,27528,,14,,,,,,,,,,,,,,,,
+16384,131072,2931.975,1987.492,-32.21,944.483,2291.456,-13.27,303.964,33790,26535,14,,,,,,,,,,,,,,,,
+24576,196608,5520.709,3778.226,-31.56,1742.483,4086.193,-7.54,307.967,59796,49620,14,,3843.538,-5.94,65.31,/home/dathar/Phantora/qh07v-points-aQv4GH/l4-24576,7539.260,7054.083,-6.44,3453.067,3210.545,92418,78540,15,gpu01:/home/dathar/Phantora/runs/20261117-220104-mtp-l4-24576-real-e16e505d,gpu01:/home/dathar/Phantora/runs/20261117-183343-mtp-l4-24576-c8da1756,"MTP 1 layer = a 2nd full-attention layer (the 4-layer model has 1), so s^2 attention ops double; baseline = QH-07v 3843.538 / real prefetch 4086.193; Phantora captures 93.0% of the real MTP cost"
+32768,262144,10164.137,5908.358,-41.87,4255.779,7608.697,-22.35,1700.339,96442,83904,14,Phantora simulated VRAM raised to 131072 MiB; real at memory limit; first real sample 10150.340 ms,,,,,,,,,,,,,,,
