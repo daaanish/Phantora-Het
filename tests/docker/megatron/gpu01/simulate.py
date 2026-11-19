@@ -32,6 +32,8 @@ parser.add_argument("--micro-batch-size", type=int, default=1)
 parser.add_argument("--gradient-accumulation", type=int, default=8)
 parser.add_argument("--tensor-parallel-size", type=int, default=2)
 parser.add_argument("--pipeline-parallel-size", type=int, default=1)
+parser.add_argument("--data-parallel-size", type=int, default=1,
+                    help="DP replicas; --gradient-accumulation is per replica, global batch = MB * GA * DP")
 parser.add_argument("--pipeline-stage-layers", default=None,
                     help="uneven PP: decoder layers per stage, e.g. 1,3 (default: even split)")
 parser.add_argument("--iterations", type=int, default=4)
@@ -57,13 +59,14 @@ from pipeline_split import parse_stage_layers
 
 TP = args.tensor_parallel_size
 PP = args.pipeline_parallel_size
-WORLD = TP * PP  # DP = 1; all ranks on this one host
+DP = args.data_parallel_size
+WORLD = TP * DP * PP  # all ranks on this one host
 WORKLOAD = HybridConfig(model=HYBRID_PRESETS[args.preset], tensor_parallel_size=TP,
-                        pipeline_parallel_size=PP, world_size=WORLD,
+                        pipeline_parallel_size=PP, data_parallel_size=DP, world_size=WORLD,
                         pipeline_stage_layers=parse_stage_layers(args.pipeline_stage_layers),
                         sequence_length=args.sequence_length, micro_batch_size=args.micro_batch_size,
                         gradient_accumulation=args.gradient_accumulation,
-                        global_batch_size=args.micro_batch_size * args.gradient_accumulation,
+                        global_batch_size=args.micro_batch_size * args.gradient_accumulation * DP,
                         mtp_num_layers=args.mtp_layers)
 ITERATIONS = args.iterations
 HOST = "gpu01.pronet.rcac.purdue.edu"
@@ -84,9 +87,9 @@ def sha256(path):
 
 def prepare(output, shared):
     run_id = uuid.uuid4().hex
-    # Core's default rank order is TP-DP-PP; PP is the slowest-varying coordinate (DP = 1 here).
+    # Core's default rank order is TP-DP-PP; PP is the slowest-varying coordinate.
     plan = dict(run_id=run_id, expected_world=WORLD, expected={
-        str(rank): expected_events(WORKLOAD, rank // TP, ITERATIONS) for rank in range(WORLD)})
+        str(rank): expected_events(WORKLOAD, rank // (TP * DP), ITERATIONS) for rank in range(WORLD)})
     write_json(output / "plan.json", plan)
     (output / "netconfig.toml").write_bytes(args.calibrated_netconfig.read_bytes())
     for name in ("home", "tmp", "triton"):
@@ -130,10 +133,10 @@ def prepare(output, shared):
                            "--coverage-mode", "discovery"], {"PHANTORA_LOG": args.sim_log_level}),
         worker=command(["/phantora/dist/phantora_run", "torchrun", "--standalone", f"--nproc-per-node={WORLD}",
                         "/phantora/tests/test_megatron.py", "--hybrid-preset", args.preset,
-                        "--tensor_parallel_size", str(TP), "--data_parallel_size", "1",
+                        "--tensor_parallel_size", str(TP), "--data_parallel_size", str(DP),
                         "--pipeline_model_parallel_size", str(PP), "--sequence_length", str(args.sequence_length),
                         "--micro_batch_size", str(args.micro_batch_size),
-                        "--global_batch_size", str(args.micro_batch_size * args.gradient_accumulation),
+                        "--global_batch_size", str(args.micro_batch_size * args.gradient_accumulation * DP),
                         "--gradient_accumulation", str(args.gradient_accumulation),
                         "--iterations", str(ITERATIONS),
                         *(["--mtp-layers", str(args.mtp_layers)] if args.mtp_layers else []),

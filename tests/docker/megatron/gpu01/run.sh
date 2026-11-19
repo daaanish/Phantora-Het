@@ -7,7 +7,9 @@
 #   --mb N            micro-batch size (default 1)
 #   --ga N            gradient accumulation (default 8)
 #   --tp N            tensor-parallel size (default 2)
-#   --pp N            pipeline-parallel size (default 1); GPUs = TP * PP, DP = 1
+#   --pp N            pipeline-parallel size (default 1)
+#   --dp N            data-parallel size (default 1); GPUs = TP * PP * DP. --ga stays per replica,
+#                     so the global batch is mb * ga * dp
 #   --stage-layers L  uneven PP split, decoder layers per stage, e.g. 1,3 (default: Megatron's even split)
 #   --iterations N    training iterations (default 4; step time = mean of iterations 2..N, slower rank)
 #   --mtp N           train N multi-token-prediction layers (default 0 = off; Qwen3.5 has 1)
@@ -27,7 +29,7 @@ source "$here/paths.sh"
 name=${1:?usage: run.sh <name> --preset P --seq N [options]}; shift
 [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || ph_die "name may use letters, digits, . _ - only"
 preset="" seq="" stages="discovery,profile,replay" base_db="" mb=1 ga=8 tp=2 iters=4 vram=97887
-sim_log=debug expandable="" allow_unpushed=0 mtp=0 pp=1 stage_layers=""
+sim_log=debug expandable="" allow_unpushed=0 mtp=0 pp=1 dp=1 stage_layers=""
 while (( $# )); do
     case $1 in
         --preset) preset=$2; shift 2;; --seq) seq=$2; shift 2;; --stages) stages=$2; shift 2;;
@@ -35,16 +37,16 @@ while (( $# )); do
         --tp) tp=$2; shift 2;; --iterations) iters=$2; shift 2;; --vram-mib) vram=$2; shift 2;;
         --sim-log) sim_log=$2; shift 2;; --expandable) expandable=1; shift;; --no-expandable) expandable=0; shift;;
         --allow-unpushed) allow_unpushed=1; shift;; --mtp) mtp=$2; shift 2;;
-        --pp) pp=$2; shift 2;; --stage-layers) stage_layers=$2; shift 2;;
+        --pp) pp=$2; shift 2;; --dp) dp=$2; shift 2;; --stage-layers) stage_layers=$2; shift 2;;
         *) ph_die "unknown option $1";;
     esac
 done
 [[ -n $preset && -n $seq ]] || ph_die "--preset and --seq are required"
 [[ $mtp =~ ^[0-9]+$ ]] || ph_die "--mtp takes a non-negative integer"
-[[ $tp =~ ^[1-9][0-9]*$ && $pp =~ ^[1-9][0-9]*$ ]] || ph_die "--tp and --pp take positive integers"
+[[ $tp =~ ^[1-9][0-9]*$ && $pp =~ ^[1-9][0-9]*$ && $dp =~ ^[1-9][0-9]*$ ]] || ph_die "--tp, --pp and --dp take positive integers"
 [[ -z $stage_layers || $stage_layers =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || ph_die "--stage-layers takes e.g. 1,3"
 [[ -z $stage_layers ]] || (( $(tr ',' '\n' <<< "$stage_layers" | wc -l) == pp )) || ph_die "--stage-layers needs $pp entries"
-world=$((tp * pp))
+world=$((tp * pp * dp))
 [[ -z $expandable ]] && { [[ $preset == 0.8b-l4 ]] && expandable=1 || expandable=0; }
 has() { [[ ",$stages," == *",$1,"* ]]; }
 for s in ${stages//,/ }; do [[ $s =~ ^(discovery|profile|replay|real)$ ]] || ph_die "unknown stage $s"; done
@@ -73,13 +75,14 @@ cp "$build/build.json" "$run/build.json"
 python3 - "$run/config.json" <<P
 import json, sys
 json.dump(dict(name="$name", commit="$commit", preset="$preset", sequence_length=$seq, micro_batch_size=$mb,
-               gradient_accumulation=$ga, tensor_parallel_size=$tp, pipeline_parallel_size=$pp,
+               gradient_accumulation=$ga, global_batch_size=$((mb * ga * dp)), tensor_parallel_size=$tp,
+               pipeline_parallel_size=$pp, data_parallel_size=$dp,
                pipeline_stage_layers=[int(x) for x in "$stage_layers".split(",")] if "$stage_layers" else None,
                world_size=$world, iterations=$iters, vram_mib=$vram, mtp_layers=$mtp,
                stages="$stages".split(","), base_db="$base_db" or None, sim_log_level="$sim_log",
                real_expandable_segments=bool($expandable), host="$(hostname)"), open(sys.argv[1], "w"), indent=1)
 P
-ph_log "run $run: $preset seq $seq, tp $tp pp $pp${stage_layers:+ split $stage_layers}, mtp $mtp, stages $stages, commit ${commit:0:8}"
+ph_log "run $run: $preset seq $seq, tp $tp pp $pp dp $dp${stage_layers:+ split $stage_layers}, mtp $mtp, stages $stages, commit ${commit:0:8}"
 scratch=$(mktemp -d "$PH_SCRATCH/ph-run-XXXXXX")
 trap 'rm -rf -- "$scratch"' EXIT
 
@@ -89,7 +92,7 @@ simulate() {  # <perf-db> <stage> <log-level>
         --torch-prefix "$torch_dir/torch-deps" --causal-prefix "$PH_ENV/causal-deps" --upgraded-prefix "$PH_ENV/upgraded-deps" \
         --perf-db "$1" --calibrated-netconfig "$g/netconfig.toml" --output-dir "$out" \
         --preset "$preset" --sequence-length "$seq" --micro-batch-size "$mb" --gradient-accumulation "$ga" \
-        --tensor-parallel-size "$tp" --pipeline-parallel-size "$pp" ${stage_layers:+--pipeline-stage-layers "$stage_layers"} --iterations "$iters" --vram-mib "$vram" --sim-log-level "$3" --mtp-layers "$mtp" \
+        --tensor-parallel-size "$tp" --pipeline-parallel-size "$pp" --data-parallel-size "$dp" ${stage_layers:+--pipeline-stage-layers "$stage_layers"} --iterations "$iters" --vram-mib "$vram" --sim-log-level "$3" --mtp-layers "$mtp" \
         > "$run/$2.log" 2>&1 || rc=$?
     local o; o=$(ls -d "$out"/discover-* 2>/dev/null | head -1)
     mkdir -p "$run/$2"
@@ -156,9 +159,9 @@ if has real; then
     mon=$!
     rc=0
     APPTAINERENV_CUDA_VISIBLE_DEVICES="$gpus" APPTAINERENV_QH_TORCH_REVISION="$torch_rev" APPTAINERENV_QH_TP=$tp \
-    APPTAINERENV_QH_PRESET=$preset APPTAINERENV_QH_SEQ=$seq APPTAINERENV_QH_MB=$mb APPTAINERENV_QH_GBS=$((mb * ga)) \
+    APPTAINERENV_QH_PRESET=$preset APPTAINERENV_QH_SEQ=$seq APPTAINERENV_QH_MB=$mb APPTAINERENV_QH_GBS=$((mb * ga * dp)) \
     APPTAINERENV_QH_ITERS=$iters APPTAINERENV_QH_EXPANDABLE=$expandable APPTAINERENV_QH_MTP=$mtp \
-    APPTAINERENV_QH_PP=$pp APPTAINERENV_QH_STAGE_LAYERS="$stage_layers" \
+    APPTAINERENV_QH_PP=$pp APPTAINERENV_QH_DP=$dp APPTAINERENV_QH_STAGE_LAYERS="$stage_layers" \
         timeout -k 25 3600 apptainer exec --containall --cleanenv --nv \
         --bind "$binds_common,$scratch/rcache:/qh-cache" --pwd /qh-run "$PH_SIF" bash "/qh-src/tests/docker/megatron/gpu01/real_inside.sh" \
         > "$r/trainer.log" 2>&1 || rc=$?

@@ -52,9 +52,14 @@ tests/docker/megatron/gpu01/run.sh <name> --preset 0.8b --seq 8192 --base-db <db
 - `--mtp N`: train N multi-token-prediction layers (Qwen3.5 has 1). Default 0, as in every
   run before QH-07w; applies to the simulated and the real stages alike.
 - `--pp N` (default 1) and `--stage-layers 1,3` (uneven split, one decoder-layer count per
-  stage; default Megatron's even split). GPUs = TP × PP with DP 1, so gpu01's two GPUs
-  allow TP 1 PP 2. The coverage plan expects each rank's own stage's events
-  (pp_rank = rank // TP); `metrics.py` waits for all TP × PP ranks.
+  stage; default Megatron's even split).
+- `--dp N` (default 1, as in every run before it was added): data-parallel replicas.
+  GPUs = TP × PP × DP; gpu01's two GPUs allow a real run for TP 2, TP 1 PP 2 or TP 1 DP 2.
+  Simulated stages accept any world size (all ranks on one simulated host at the measured
+  loopback rate). `--ga` stays per replica, so the global batch is MB × GA × DP and each
+  GPU does the same microbatches as at DP 1. The coverage plan expects each rank's own
+  stage's events (pp_rank = rank // (TP × DP), Megatron's TP-DP-PP order); `metrics.py`
+  waits for all ranks.
 - Other options (`--mb`, `--ga`, `--tp`, `--iterations`, `--vram-mib`, `--sim-log`,
   `--expandable`) are listed at the top of `run.sh`. Defaults match the QH-07 sweeps:
   TP 2, micro-batch 1, accumulation 8, 4 iterations, 97,887 MiB simulated memory.
