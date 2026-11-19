@@ -6,7 +6,9 @@
 #   --base-db DIR     perf DB to start from (required for discovery/replay); copied, never modified
 #   --mb N            micro-batch size (default 1)
 #   --ga N            gradient accumulation (default 8)
-#   --tp N            tensor-parallel size = GPUs (default 2)
+#   --tp N            tensor-parallel size (default 2)
+#   --pp N            pipeline-parallel size (default 1); GPUs = TP * PP, DP = 1
+#   --stage-layers L  uneven PP split, decoder layers per stage, e.g. 1,3 (default: Megatron's even split)
 #   --iterations N    training iterations (default 4; step time = mean of iterations 2..N, slower rank)
 #   --mtp N           train N multi-token-prediction layers (default 0 = off; Qwen3.5 has 1)
 #   --vram-mib M      simulated GPU memory (default 97887; seq 32768 needed 131072)
@@ -25,7 +27,7 @@ source "$here/paths.sh"
 name=${1:?usage: run.sh <name> --preset P --seq N [options]}; shift
 [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || ph_die "name may use letters, digits, . _ - only"
 preset="" seq="" stages="discovery,profile,replay" base_db="" mb=1 ga=8 tp=2 iters=4 vram=97887
-sim_log=debug expandable="" allow_unpushed=0 mtp=0
+sim_log=debug expandable="" allow_unpushed=0 mtp=0 pp=1 stage_layers=""
 while (( $# )); do
     case $1 in
         --preset) preset=$2; shift 2;; --seq) seq=$2; shift 2;; --stages) stages=$2; shift 2;;
@@ -33,11 +35,16 @@ while (( $# )); do
         --tp) tp=$2; shift 2;; --iterations) iters=$2; shift 2;; --vram-mib) vram=$2; shift 2;;
         --sim-log) sim_log=$2; shift 2;; --expandable) expandable=1; shift;; --no-expandable) expandable=0; shift;;
         --allow-unpushed) allow_unpushed=1; shift;; --mtp) mtp=$2; shift 2;;
+        --pp) pp=$2; shift 2;; --stage-layers) stage_layers=$2; shift 2;;
         *) ph_die "unknown option $1";;
     esac
 done
 [[ -n $preset && -n $seq ]] || ph_die "--preset and --seq are required"
 [[ $mtp =~ ^[0-9]+$ ]] || ph_die "--mtp takes a non-negative integer"
+[[ $tp =~ ^[1-9][0-9]*$ && $pp =~ ^[1-9][0-9]*$ ]] || ph_die "--tp and --pp take positive integers"
+[[ -z $stage_layers || $stage_layers =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || ph_die "--stage-layers takes e.g. 1,3"
+[[ -z $stage_layers ]] || (( $(tr ',' '\n' <<< "$stage_layers" | wc -l) == pp )) || ph_die "--stage-layers needs $pp entries"
+world=$((tp * pp))
 [[ -z $expandable ]] && { [[ $preset == 0.8b-l4 ]] && expandable=1 || expandable=0; }
 has() { [[ ",$stages," == *",$1,"* ]]; }
 for s in ${stages//,/ }; do [[ $s =~ ^(discovery|profile|replay|real)$ ]] || ph_die "unknown stage $s"; done
@@ -66,11 +73,13 @@ cp "$build/build.json" "$run/build.json"
 python3 - "$run/config.json" <<P
 import json, sys
 json.dump(dict(name="$name", commit="$commit", preset="$preset", sequence_length=$seq, micro_batch_size=$mb,
-               gradient_accumulation=$ga, tensor_parallel_size=$tp, iterations=$iters, vram_mib=$vram, mtp_layers=$mtp,
+               gradient_accumulation=$ga, tensor_parallel_size=$tp, pipeline_parallel_size=$pp,
+               pipeline_stage_layers=[int(x) for x in "$stage_layers".split(",")] if "$stage_layers" else None,
+               world_size=$world, iterations=$iters, vram_mib=$vram, mtp_layers=$mtp,
                stages="$stages".split(","), base_db="$base_db" or None, sim_log_level="$sim_log",
                real_expandable_segments=bool($expandable), host="$(hostname)"), open(sys.argv[1], "w"), indent=1)
 P
-ph_log "run $run: $preset seq $seq, mtp $mtp, stages $stages, commit ${commit:0:8}"
+ph_log "run $run: $preset seq $seq, tp $tp pp $pp${stage_layers:+ split $stage_layers}, mtp $mtp, stages $stages, commit ${commit:0:8}"
 scratch=$(mktemp -d "$PH_SCRATCH/ph-run-XXXXXX")
 trap 'rm -rf -- "$scratch"' EXIT
 
@@ -80,7 +89,7 @@ simulate() {  # <perf-db> <stage> <log-level>
         --torch-prefix "$torch_dir/torch-deps" --causal-prefix "$PH_ENV/causal-deps" --upgraded-prefix "$PH_ENV/upgraded-deps" \
         --perf-db "$1" --calibrated-netconfig "$g/netconfig.toml" --output-dir "$out" \
         --preset "$preset" --sequence-length "$seq" --micro-batch-size "$mb" --gradient-accumulation "$ga" \
-        --tensor-parallel-size "$tp" --iterations "$iters" --vram-mib "$vram" --sim-log-level "$3" --mtp-layers "$mtp" \
+        --tensor-parallel-size "$tp" --pipeline-parallel-size "$pp" ${stage_layers:+--pipeline-stage-layers "$stage_layers"} --iterations "$iters" --vram-mib "$vram" --sim-log-level "$3" --mtp-layers "$mtp" \
         > "$run/$2.log" 2>&1 || rc=$?
     local o; o=$(ls -d "$out"/discover-* 2>/dev/null | head -1)
     mkdir -p "$run/$2"
@@ -90,7 +99,7 @@ simulate() {  # <perf-db> <stage> <log-level>
         [[ $3 == debug ]] && python3 "$g/events_agg.py" "$o/simulator.log" "$run/$2/events.jsonl.gz" > "$run/$2/events_agg.log" 2>&1
     fi
     echo "$rc" > "$run/$2/exit"
-    ph_log "$2 exit $rc: $(python3 "$g/metrics.py" "$run/$2/worker.log") ms; missing compute keys $([[ -f $run/$2/perfdb.missing/compute.csv ]] && echo $(($(wc -l < "$run/$2/perfdb.missing/compute.csv") - 1)) || echo 0)"
+    ph_log "$2 exit $rc: $(python3 "$g/metrics.py" --ranks "$world" "$run/$2/worker.log") ms; missing compute keys $([[ -f $run/$2/perfdb.missing/compute.csv ]] && echo $(($(wc -l < "$run/$2/perfdb.missing/compute.csv") - 1)) || echo 0)"
     rm -rf -- "$out"
 }
 
@@ -138,31 +147,34 @@ fi
 
 if has real; then
     r="$run/real"; mkdir -p "$r" "$scratch/rcache"
-    ph_log "real: waiting for GPUs 0,1"
-    ph_wait_idle 0,1 || ph_die "GPUs not idle after waiting"
-    gpus=$(nvidia-smi --query-gpu=uuid --format=csv,noheader | head -"$tp" | paste -sd, -)
+    idx=$(seq -s, 0 $((world - 1)))
+    (( $(nvidia-smi --query-gpu=uuid --format=csv,noheader | wc -l) >= world )) || ph_die "real needs $world GPUs"
+    ph_log "real: waiting for GPUs $idx"
+    ph_wait_idle "$idx" || ph_die "GPUs not idle after waiting"
+    gpus=$(nvidia-smi --query-gpu=uuid --format=csv,noheader | head -"$world" | paste -sd, -)
     ( while sleep 2; do nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | paste -sd, -; done > "$r/mem.csv" ) &
     mon=$!
     rc=0
     APPTAINERENV_CUDA_VISIBLE_DEVICES="$gpus" APPTAINERENV_QH_TORCH_REVISION="$torch_rev" APPTAINERENV_QH_TP=$tp \
     APPTAINERENV_QH_PRESET=$preset APPTAINERENV_QH_SEQ=$seq APPTAINERENV_QH_MB=$mb APPTAINERENV_QH_GBS=$((mb * ga)) \
     APPTAINERENV_QH_ITERS=$iters APPTAINERENV_QH_EXPANDABLE=$expandable APPTAINERENV_QH_MTP=$mtp \
+    APPTAINERENV_QH_PP=$pp APPTAINERENV_QH_STAGE_LAYERS="$stage_layers" \
         timeout -k 25 3600 apptainer exec --containall --cleanenv --nv \
         --bind "$binds_common,$scratch/rcache:/qh-cache" --pwd /qh-run "$PH_SIF" bash "/qh-src/tests/docker/megatron/gpu01/real_inside.sh" \
         > "$r/trainer.log" 2>&1 || rc=$?
     kill "$mon" 2>/dev/null || true
     echo "$rc" > "$r/exit"
-    ph_log "real exit $rc: $(python3 "$g/metrics.py" "$r"/ranks/*/*/*/stdout.log) ms; peak $(sort -t, -k1 -n "$r/mem.csv" | tail -1) MiB"
+    ph_log "real exit $rc: $(python3 "$g/metrics.py" --ranks "$world" "$r"/ranks/*/*/*/stdout.log) ms; peak $(sort -t, -k1 -n "$r/mem.csv" | tail -1) MiB"
 fi
 
-python3 - "$run" "$g/metrics.py" <<'P'
+python3 - "$run" "$g/metrics.py" "$world" <<'P'
 import json, subprocess, sys
 from pathlib import Path
-run, metrics = Path(sys.argv[1]), sys.argv[2]
+run, metrics, world = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 def ms(files):
     files = [str(f) for f in files if f.exists()]
     if not files: return None
-    out = subprocess.run([sys.executable, metrics, *files], capture_output=True, text=True).stdout.strip()
+    out = subprocess.run([sys.executable, metrics, "--ranks", world, *files], capture_output=True, text=True).stdout.strip()
     return float(out) if out else None
 s = dict(commit=(run / "commit.txt").read_text().strip(), config=json.load(open(run / "config.json")))
 for stage in ("discovery", "replay"):

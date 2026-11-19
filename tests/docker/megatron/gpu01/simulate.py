@@ -31,6 +31,9 @@ parser.add_argument("--sequence-length", type=int, required=True)
 parser.add_argument("--micro-batch-size", type=int, default=1)
 parser.add_argument("--gradient-accumulation", type=int, default=8)
 parser.add_argument("--tensor-parallel-size", type=int, default=2)
+parser.add_argument("--pipeline-parallel-size", type=int, default=1)
+parser.add_argument("--pipeline-stage-layers", default=None,
+                    help="uneven PP: decoder layers per stage, e.g. 1,3 (default: even split)")
 parser.add_argument("--iterations", type=int, default=4)
 parser.add_argument("--mtp-layers", type=int, default=0, help="trained MTP layers (0 = off)")
 parser.add_argument("--vram-mib", type=int, default=97887)
@@ -50,9 +53,14 @@ if sys.version_info < (3, 10):
 from hybrid_run import stop_processes, validate_final_status, wait_all
 from qwen_hybrid_config import HYBRID_PRESETS, HybridConfig
 from qwen_hybrid_control import expected_events
+from pipeline_split import parse_stage_layers
 
 TP = args.tensor_parallel_size
-WORKLOAD = HybridConfig(model=HYBRID_PRESETS[args.preset], tensor_parallel_size=TP, world_size=TP,
+PP = args.pipeline_parallel_size
+WORLD = TP * PP  # DP = 1; all ranks on this one host
+WORKLOAD = HybridConfig(model=HYBRID_PRESETS[args.preset], tensor_parallel_size=TP,
+                        pipeline_parallel_size=PP, world_size=WORLD,
+                        pipeline_stage_layers=parse_stage_layers(args.pipeline_stage_layers),
                         sequence_length=args.sequence_length, micro_batch_size=args.micro_batch_size,
                         gradient_accumulation=args.gradient_accumulation,
                         global_batch_size=args.micro_batch_size * args.gradient_accumulation,
@@ -76,8 +84,9 @@ def sha256(path):
 
 def prepare(output, shared):
     run_id = uuid.uuid4().hex
-    events = expected_events(WORKLOAD, 0, ITERATIONS)
-    plan = dict(run_id=run_id, expected_world=TP, expected={str(rank): events for rank in range(TP)})
+    # Core's default rank order is TP-DP-PP; PP is the slowest-varying coordinate (DP = 1 here).
+    plan = dict(run_id=run_id, expected_world=WORLD, expected={
+        str(rank): expected_events(WORKLOAD, rank // TP, ITERATIONS) for rank in range(WORLD)})
     write_json(output / "plan.json", plan)
     (output / "netconfig.toml").write_bytes(args.calibrated_netconfig.read_bytes())
     for name in ("home", "tmp", "triton"):
@@ -97,7 +106,7 @@ def prepare(output, shared):
                PYTHONPATH="/qh-torch:/qh-causal:/qh-upgraded",
                PHANTORA_SOCKET_PREFIX="/qh-ipc/p", PHANTORA_GPU_NAME=GPU,
                PHANTORA_IGNORE_CPU_TIME="1", PHANTORA_USE_CUPTI="1")
-    runner_env = dict(PHANTORA_COVERAGE="1", PHANTORA_RUN_ID=run_id, PHANTORA_NGPU=str(TP),
+    runner_env = dict(PHANTORA_COVERAGE="1", PHANTORA_RUN_ID=run_id, PHANTORA_NGPU=str(WORLD),
                       PHANTORA_VRAM_MIB=str(args.vram_mib), CUDA_DEVICE_MAX_CONNECTIONS="1")
     # Apptainer ranks and the server share the host PID namespace and the same socket directory.
     apptainer = ["apptainer", "exec", "--cleanenv", "--contain", "--no-mount", "home,cwd", "--pwd", "/qh-run"]
@@ -116,23 +125,24 @@ def prepare(output, shared):
                          "runpy.run_path('/phantora/tests/qwen_hybrid_runtime_check.py', run_name='__main__')"],
                         {"PHANTORA": "1", "LD_LIBRARY_PATH": "/phantora/dist:" + env["LD_LIBRARY_PATH"]}),
         simulator=command(["/phantora/dist/phantora_server", "--netconfig", "/qh-run/netconfig.toml",
-                           "--perf-db", "/qh-run/perfdb", "--run-id", run_id, "--expected-ranks", str(TP),
+                           "--perf-db", "/qh-run/perfdb", "--run-id", run_id, "--expected-ranks", str(WORLD),
                            "--coverage-plan", "/qh-run/plan.json", "--coverage-status", "/qh-run/status.json",
                            "--coverage-mode", "discovery"], {"PHANTORA_LOG": args.sim_log_level}),
-        worker=command(["/phantora/dist/phantora_run", "torchrun", "--standalone", f"--nproc-per-node={TP}",
+        worker=command(["/phantora/dist/phantora_run", "torchrun", "--standalone", f"--nproc-per-node={WORLD}",
                         "/phantora/tests/test_megatron.py", "--hybrid-preset", args.preset,
                         "--tensor_parallel_size", str(TP), "--data_parallel_size", "1",
-                        "--pipeline_model_parallel_size", "1", "--sequence_length", str(args.sequence_length),
+                        "--pipeline_model_parallel_size", str(PP), "--sequence_length", str(args.sequence_length),
                         "--micro_batch_size", str(args.micro_batch_size),
                         "--global_batch_size", str(args.micro_batch_size * args.gradient_accumulation),
                         "--gradient_accumulation", str(args.gradient_accumulation),
                         "--iterations", str(ITERATIONS),
-                        *(["--mtp-layers", str(args.mtp_layers)] if args.mtp_layers else [])], runner_env),
+                        *(["--mtp-layers", str(args.mtp_layers)] if args.mtp_layers else []),
+                        *(["--pipeline_stage_layers", args.pipeline_stage_layers] if args.pipeline_stage_layers else [])], runner_env),
     )
     write_json(output / "commands.json", commands)
     write_json(output / "workload.json", dict(
         workload=asdict(WORKLOAD), iterations=ITERATIONS, cpu_time_policy="ignored in replay",
-        gpu=GPU, gpu_per_host=[TP], host=HOST, vram_mib=args.vram_mib, dtype="bfloat16", device_visibility="none",
+        gpu=GPU, gpu_per_host=[WORLD], host=HOST, vram_mib=args.vram_mib, dtype="bfloat16", device_visibility="none",
         perf_db=str(args.perf_db), perf_db_manifest=(args.perf_db / "manifest.md").read_text(),
         network_policy="same-host loopback rate from prior 8 MiB NCCL all-reduce; one fixed rate at all sizes",
         calibrated_netconfig=str(args.calibrated_netconfig), timing_result_accepted=False))
@@ -179,7 +189,7 @@ def main():
             return 0
         shutil.copytree(args.perf_db, output / "perfdb")
         paths = [*sorted(args.native_dist.glob("*")), *sorted((output / "perfdb").glob("*")),
-                 *sorted(args.tests.glob("qwen_hybrid_*.py")), args.tests / "test_megatron.py",
+                 *sorted(args.tests.glob("qwen_hybrid_*.py")), args.tests / "pipeline_split.py", args.tests / "test_megatron.py",
                  args.torch_prefix / "torch" / "version.py", args.calibrated_netconfig]
         write_json(output / "input-hashes.json", {str(path): sha256(path) for path in paths if path.is_file()})
         result = dict(run_id=run_id, exit_code=1, valid=False, timing_result_accepted=False, artifact_directory=str(output))
@@ -199,7 +209,7 @@ def main():
                     wait_phase(output / "status.json", run_id, "ready", min(deadline, time.monotonic() + 30), process)
             result["worker_exit_codes"] = wait_all(processes[-1:], max(0, deadline - time.monotonic()))
             status = wait_phase(output / "status.json", run_id, "complete", deadline, processes[1])
-            result["valid"] = validate_final_status(status, run_id, TP)
+            result["valid"] = validate_final_status(status, run_id, WORLD)
             result["exit_code"] = 0
         except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
             result["error"] = str(error)
