@@ -7,6 +7,8 @@ Layer indices are zero-based global indices, including after pipeline partitioni
 from dataclasses import dataclass, replace
 import math
 
+from pipeline_split import stage_ranges, validate_stage_layers
+
 QWEN35_CONFIG_REVISION = "c202236235762e1c871ad0ccb60c8ee5ba337b9a"
 QWEN35_CONFIG_SOURCE = (
     "https://huggingface.co/Qwen/Qwen3.5-9B/resolve/"
@@ -135,6 +137,8 @@ class HybridConfig:
     vision: bool = False
     # Trained MTP depth (Megatron mtp_num_layers); 0 = off, the behaviour of every run before QH-07w.
     mtp_num_layers: int = 0
+    # Decoder layers per PP stage, e.g. (7, 9, 9, 7); None = Megatron's even split.
+    pipeline_stage_layers: tuple[int, ...] | None = None
     dtype: str = "bfloat16"
 
     def __post_init__(self):
@@ -162,7 +166,9 @@ class HybridConfig:
                 raise ValueError(f"{name} is unsupported for the initial hybrid workload")
         if self.dtype != "bfloat16":
             raise ValueError("hybrid initially requires bfloat16")
-        if self.model.num_layers % self.pipeline_parallel_size:
+        if self.pipeline_stage_layers is not None:
+            validate_stage_layers(self.pipeline_stage_layers, self.model.num_layers, self.pipeline_parallel_size)
+        elif self.model.num_layers % self.pipeline_parallel_size:
             raise ValueError("num_layers must be divisible by PP")
         # Restrict to whole head shards; replicated KV heads need a separate gate.
         for name in (
@@ -183,11 +189,14 @@ class HybridConfig:
         return self.effective_batch_size * self.sequence_length
 
     def pipeline_layers(self, stage):
-        """Return (global index, layer type) pairs for a contiguous PP stage."""
+        """Return (global index, layer type) pairs for a contiguous PP stage (even or uneven split)."""
         if type(stage) is not int or not 0 <= stage < self.pipeline_parallel_size:
             raise ValueError("pipeline stage must be in [0, PP)")
-        width = self.model.num_layers // self.pipeline_parallel_size
-        start = stage * width
+        if self.pipeline_stage_layers is not None:
+            start, width = stage_ranges(self.pipeline_stage_layers)[stage]
+        else:
+            width = self.model.num_layers // self.pipeline_parallel_size
+            start = stage * width
         return tuple(enumerate(self.model.layer_types[start:start + width], start=start))
 
 
@@ -236,4 +245,5 @@ def configure_hybrid_args(args, argv, world_size):
         virtual_pipeline_size=args.virtual_pipeline_model_parallel_size,
         recompute_activations=args.recompute_activations,
         mtp_num_layers=getattr(args, "mtp_layers", 0),
+        pipeline_stage_layers=getattr(args, "pipeline_stage_layers", None),
     )

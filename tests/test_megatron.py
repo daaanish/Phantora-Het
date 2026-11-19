@@ -120,6 +120,7 @@ def get_model(
     kv_channels=None,
     qk_layernorm=False,
     hybrid_config=None,
+    pipeline_layout=None,
 ):
     # MoE config is only added when num_moe_experts is set, so dense models are
     # unchanged. moe_token_dispatcher_type="alltoall" is what makes Megatron emit
@@ -165,6 +166,9 @@ def get_model(
         pipeline_dtype=torch.bfloat16,
         attention_backend=AttnBackend.local if hybrid_config is not None else AttnBackend.flash,
         recompute_granularity="selective" if recompute_activations else None,
+        # Uneven PP: Megatron's layout string sets each stage's layer count and offset.
+        # Left unset (None) so even-split runs build exactly as before.
+        **(dict(pipeline_model_parallel_layout=pipeline_layout) if pipeline_layout is not None else {}),
         **moe_config_kwargs,
     )
 
@@ -328,6 +332,7 @@ def main(
     qk_layernorm=False,
     hybrid_config=None,
     prefetch=True,
+    pipeline_stage_layers=None,
 ):
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
@@ -360,6 +365,14 @@ def main(
 
     model_parallel_cuda_manual_seed(42)
 
+    pipeline_layout = None
+    if pipeline_stage_layers is not None:
+        from pipeline_split import layout_string
+        pipeline_layout = layout_string(
+            pipeline_stage_layers, hybrid_config.mtp_num_layers if hybrid_config is not None else 0)
+        if rank == 0:
+            print(f"Pipeline layout: {pipeline_layout}")
+
     if virtual_pipeline_model_parallel_size is None:
         model = get_model(
             tensor_parallel_size,
@@ -386,6 +399,7 @@ def main(
             kv_channels=kv_channels,
             qk_layernorm=qk_layernorm,
             hybrid_config=hybrid_config,
+            pipeline_layout=pipeline_layout,
         )
         model = model.to(device)
         model.train()
@@ -417,6 +431,7 @@ def main(
                 expert_model_parallel_size=expert_model_parallel_size,
                 kv_channels=kv_channels,
                 qk_layernorm=qk_layernorm,
+                pipeline_layout=pipeline_layout,
             )
             model_chunk = model_chunk.to(device)
             model_chunk.train()
@@ -449,6 +464,7 @@ def main(
         print("HYBRID_CONFIG " + json.dumps(dict(
             rank=rank, pp_rank=pp_rank, workload=asdict(hybrid_config),
             layers=hybrid_config.pipeline_layers(pp_rank),
+            pipeline_stage_layers=hybrid_config.pipeline_stage_layers,
             tokens_per_iteration=hybrid_config.tokens_per_iteration,
             source=HYBRID_CONFIG_SOURCES.get(hybrid_config.model, "synthetic debug dimensions"),
             memory_validated=False,
@@ -553,6 +569,9 @@ if __name__ == "__main__":
     parser.add_argument("--pipeline_model_parallel_size", type=int, default=1)
     parser.add_argument("--virtual_pipeline_model_parallel_size", type=int, default=None)
     parser.add_argument("--num_layers", type=int, default=32)
+    parser.add_argument("--pipeline_stage_layers", type=str, default=None,
+        help="Uneven PP: decoder layers per stage, e.g. 7,9,9,7 (PP*VPP entries, VPP-major). "
+             "Default: Megatron's even split.")
     parser.add_argument("--hidden_size", type=int, default=4096)
     parser.add_argument("--ffn_hidden_size", type=int, default=11008)
     parser.add_argument("--num_attention_heads", type=int, default=32)
@@ -589,6 +608,11 @@ if __name__ == "__main__":
     parser.add_argument("--qk_layernorm", action="store_true",
         help="Apply RMSNorm to Q and K (QK-norm); used by Qwen3.")
     args = parser.parse_args()
+    from pipeline_split import parse_stage_layers, validate_stage_layers
+    try:
+        args.pipeline_stage_layers = parse_stage_layers(args.pipeline_stage_layers)
+    except ValueError as exc:
+        parser.error(str(exc))
     hybrid_config = None
     if args.hybrid_preset is not None:
         import sys
@@ -601,6 +625,12 @@ if __name__ == "__main__":
         parser.error("--global_batch_size/--data_parallel_size require --hybrid-preset")
     elif args.mtp_layers:
         parser.error("--mtp-layers requires --hybrid-preset")
+    if args.pipeline_stage_layers is not None:
+        try:
+            validate_stage_layers(args.pipeline_stage_layers, args.num_layers,
+                                  args.pipeline_model_parallel_size, args.virtual_pipeline_model_parallel_size)
+        except ValueError as exc:
+            parser.error(str(exc))
     if hybrid_config is not None and args.iterations < 2:
         parser.error("--iterations must be at least 2 for a steady-state average")
 
@@ -633,5 +663,6 @@ if __name__ == "__main__":
         qk_layernorm=args.qk_layernorm,
         hybrid_config=hybrid_config,
         prefetch=not args.no_prefetch_batches,
+        pipeline_stage_layers=args.pipeline_stage_layers,
     )
     disable_function_tracer()

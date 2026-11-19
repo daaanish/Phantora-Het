@@ -16,6 +16,7 @@ import uuid
 
 TESTS = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(TESTS))
+from pipeline_split import parse_stage_layers
 from qwen_hybrid_config import DEBUG_MODEL, QWEN35_9B, HybridConfig
 from qwen_hybrid_control import expected_events
 
@@ -106,7 +107,8 @@ def run(args):
         tensor_parallel_size=args.tensor_parallel_size, data_parallel_size=args.data_parallel_size,
         pipeline_parallel_size=args.pipeline_parallel_size, world_size=world,
         sequence_length=args.sequence_length, micro_batch_size=args.micro_batch_size,
-        gradient_accumulation=ga, global_batch_size=args.global_batch_size)
+        gradient_accumulation=ga, global_batch_size=args.global_batch_size,
+        pipeline_stage_layers=parse_stage_layers(args.pipeline_stage_layers))
     db = Path(args.perf_db).resolve()
     if not db.is_dir():
         raise ValueError("--perf-db must name an existing database directory")
@@ -157,7 +159,8 @@ def run(args):
         model_args = ["--hybrid-preset", args.preset, "--tensor_parallel_size", str(args.tensor_parallel_size),
             "--pipeline_model_parallel_size", str(args.pipeline_parallel_size), "--data_parallel_size", str(args.data_parallel_size),
             "--sequence_length", str(args.sequence_length), "--micro_batch_size", str(args.micro_batch_size),
-            "--global_batch_size", str(args.global_batch_size), "--gradient_accumulation", str(ga), "--iterations", str(args.iterations)]
+            "--global_batch_size", str(args.global_batch_size), "--gradient_accumulation", str(ga), "--iterations", str(args.iterations),
+            *(["--pipeline_stage_layers", args.pipeline_stage_layers] if args.pipeline_stage_layers else [])]
         for index in range(1, nhost + 1):
             log = (directory / f"host-{index}.log").open("w")
             logs.append(log)
@@ -205,6 +208,8 @@ def main():
                           ("global_batch_size", 8), ("iterations", 4), ("vram_mib", 143771)):
         parser.add_argument("--" + name.replace("_", "-"), type=int, default=default)
     parser.add_argument("--gradient-accumulation", type=int)
+    parser.add_argument("--pipeline-stage-layers", default=None,
+        help="uneven PP: decoder layers per stage, e.g. 1,3; default is the even split")
     parser.add_argument("--timeout", type=float, default=600)
     args = parser.parse_args()
     try:

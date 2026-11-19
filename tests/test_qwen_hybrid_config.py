@@ -47,6 +47,20 @@ class HybridConfigTests(unittest.TestCase):
         joined = config.pipeline_layers(0) + config.pipeline_layers(1)
         self.assertEqual(joined, tuple(enumerate(config.model.layer_types)))
 
+    def test_uneven_pipeline_split(self):
+        # 5 layers is not divisible by PP=2, but an explicit split makes it valid.
+        model = replace(DEBUG_MODEL, num_layers=5)
+        config = HybridConfig(model=model, pipeline_parallel_size=2, world_size=2,
+                              pipeline_stage_layers=(2, 3))
+        self.assertEqual(config.pipeline_layers(0), ((0, "gdn"), (1, "gdn")))
+        self.assertEqual(config.pipeline_layers(1), ((2, "gdn"), (3, "full_attention"), (4, "gdn")))
+        joined = config.pipeline_layers(0) + config.pipeline_layers(1)
+        self.assertEqual(joined, tuple(enumerate(model.layer_types)))
+        for split in ((2, 2), (5,), (0, 5), (1, 2, 2)):
+            with self.subTest(split=split), self.assertRaises(ValueError):
+                HybridConfig(model=model, pipeline_parallel_size=2, world_size=2,
+                             pipeline_stage_layers=split)
+
     def test_validation_matrix_has_exact_batch(self):
         for tp, dp, pp, ga in ((1, 1, 1, 8), (2, 1, 1, 8), (1, 2, 1, 4), (1, 1, 2, 8), (2, 2, 2, 4)):
             with self.subTest(tp=tp, dp=dp, pp=pp):

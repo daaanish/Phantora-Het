@@ -102,7 +102,7 @@ RUN python3 -m pip install --no-cache-dir --no-deps \
 RUN CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=${MAX_JOBS:-4} \
     python3 -m pip install --no-cache-dir --no-deps --no-build-isolation \
       --no-binary causal-conv1d causal-conv1d==1.5.3.post1
-COPY tests/qwen_hybrid_config.py tests/qwen_hybrid_model.py tests/qwen_hybrid_kernels.py tests/qwen_hybrid_runtime_check.py /phantora/hybrid/
+COPY tests/pipeline_split.py tests/qwen_hybrid_config.py tests/qwen_hybrid_model.py tests/qwen_hybrid_kernels.py tests/qwen_hybrid_runtime_check.py /phantora/hybrid/
 RUN python3 /phantora/hybrid/qwen_hybrid_runtime_check.py --metadata-only
 
 # Keep an untargeted build on the original framework stack.
