@@ -1,12 +1,15 @@
 # Qwen hybrid training simulation: plan and evidence
 
-Last updated: 2026-11-16 (America/Indiana/Indianapolis).
+Last updated: 2026-11-22 (America/Indiana/Indianapolis).
 
 ## Objective and current position
 
-Simulate dense Qwen3.5-9B text-decoder training with TP, DP and PP using local
-Megatron projections/MLPs and actual fused GDN kernel measurements. Add a clearly
-labeled dense Next-style adaptation after the Qwen3.5 milestone is validated.
+Simulate Qwen3.5-0.8B text-decoder training (GDN + gated full attention +
+its one MTP layer; MTP is part of the target, not optional) with TP, DP and PP using local Megatron projections/MLPs and
+actual fused GDN kernel measurements. Changed from Qwen3.5-9B on 2026-11-22 at
+the user's request; 9B is out of scope. Any 9B result recorded anywhere must
+say "9B" explicitly; an unlabeled result means 0.8B. Add a clearly labeled
+dense Next-style adaptation after the Qwen3.5 milestone is validated.
 
 **Current phase:** QH-02 passed on `gpu01` via Apptainer. Real QH-03/03a
 training smokes passed with the CUDA 12.8 assembler override. QH-07a Phantora
@@ -137,6 +140,8 @@ The four evidence columns are independent; implementation does not imply validat
 | QH-07w | Opt-in Qwen3.5 MTP layer (`--mtp-layers`, `run.sh --mtp`); QH-03a | Parent | implemented (c8da175): Megatron `MultiTokenPredictionBlock` with Qwen RMSNorm enorm/hnorm/final norm, `eh_proj` 2h→h, one gated full-attention + SwiGLU layer, shared tied LM head; default 0 leaves every earlier configuration unchanged | 72 hybrid CPU tests pass in the gpu01 image (68 at HEAD 9383f7c + 4 MTP tests) | passed: both ranks build 24 decoder layers + MTP layer and pass the structure check; no-MTP control reproduces QH-07u (2,651.727 ms) | 24L seq 8192: real 3,795.7 vs replay 3,300.1 ms (−13.1%; MTP cost real +764.9, Phantora +648.4 = 84.8%); 4L seq 24576: 7,539.3 vs 7,054.1 (−6.4%; +3,453.1 vs +3,210.5 = 93.0%); 24L seq 16384 OOM in real and simulation; 15 keys missing (14 known + `eh_proj` no-op cast) | Both ranks build the MTP block and pass the structure check; real and replay complete; MTP cost is recorded as new columns next to the no-MTP numbers |
 | QH-07x | Pipeline parallelism, even and uneven, in the gpu01 workflow (`run.sh --pp`, `--stage-layers`); uneven-PP harness (`pipeline_split.py`, `--pipeline_stage_layers`) | Parent + side session | implemented (94d484a harness, 2b7f44f gpu01 workflow): TP*PP ranks, coverage plan per PP rank (`pp_rank = rank // TP`), Megatron `pipeline_model_parallel_layout` for uneven splits | unit tests `test_pipeline_split`, `test_qwen_hybrid_config` pass (local); `simulate.py --dry-run` plans checked | passed: per-rank GDN event counts match each stage (even 64/32, split 1,3 32/64); real runs build layers [0,1]|[2,3] and [0]|[1,2,3] | 0.8b-l4 seq 8192 TP1 PP2: even real 1,564.740 vs replay 1,380.871 ms (−11.75%); split 1,3 real 1,641.614 vs 1,449.087 (−11.73%); uneven−even real +76.9, Phantora +68.2 (88.7%) | Even and uneven PP=2 complete discovery, profile, replay and real; results in `results/qwen35_pipeline_parallel/` |
 | QH-07y | 4 and 8 simulated GPUs from one-GPU profiles (TP ≤ 2 for 0.8B, so PP 4/8); QH-07x | Parent | no code change for the runs (commit 1f070b9); afterwards `run.sh --dp` (0845d55) and `metrics.py` raw_decode fix for interleaved rank output | `--dp` dry-run plans checked (TP2 DP2 PP2: ranks 0–3 stage 0, 4–7 stage 1); 18 config/split tests pass | passed: 8 runs, every rank matches its stage's events; controls reproduce QH-07x (1,380.875) and QH-07u (2,651.727) | Phantora only (gpu01 has 2 GPUs). seq 8192: 4L TP1PP4 1,316.6, TP2PP2 720.1, TP2PP4 678.8; 24L TP2PP2 1,689.1, TP2PP4 1,278.7, TP1PP8 1,859.9 ms. New keys were only Adam `_foreach_*` tensor lists (12–33 per run, 11–12 s on GPU 0, 0.2–0.5% of step) | Results in `results/qwen35_multi_gpu_pp/`; accuracy above 2 GPUs unverified without a larger machine |
+| QH-07aa | Full-target sweep: Qwen3.5-0.8B with MTP and every fix (cat/contiguous handlers + traced layouts, prefetch); QH-07u/w/x/y | Parent | no code change (commit feb78357, `--mtp 1` explicit) | n/a | 10 of 12 points complete; controls reproduce QH-07w replay exactly (3,300.120; 7,054.083) | real vs Phantora, MTP on: 24L TP2 seq 1024/4096/8192/12288: −65.9/−17.7/−12.6/−20.4%; 4L TP2 seq 1024/4096/8192/16384/24576: −42.9/−19.8/−14.7/−11.5/−6.5%; 4L TP1 DP2 seq 8192 −12.9%. PP2 (even and 1,3) FAILED in real and simulation: Megatron `param_and_grad_buffer.py:206` grad-ready-count assertion on the last stage | Results in `results/qwen35_08b_mtp_sweep/`; PP + MTP failure open |
+| QH-07z | First DP > 1 run, real vs Phantora (`run.sh --dp`); QH-07y | Parent | `--dp` in run.sh/simulate.py/real_inside.sh (0845d55), runs on feb7835 | dry-run plans and 18 tests (QH-07y) | passed: DP 2 ranks match coverage; real `HYBRID_CONFIG` shows DP 2, GBS 16, GA 8 on both ranks | 0.8b-l4 seq 8192 TP1: DP1 real 1,726.312 vs replay 1,502.404 (−12.97%); DP2 1,739.056 vs 1,517.678 (−12.73%); DP cost real +12.7, Phantora +15.3 ms (119.9%). DP 2 added 20 compute + 4 memcpy keys, timed on GPU 0 | Results in `results/qwen35_data_parallel/`; DP cost ~1% of step, so a weak test of communication; try 24 layers |
 | QH-08 | Hardware-matched calibration; QH-07 | Medium + parent review | report/compare tools prepared; execution pending | report math/mismatch cases passed | pending environment | pending environment | At most 10% steady-state iteration error in each accepted case |
 | QH-09 | Dense Next-style adaptation; QH-08 | Medium | planned | planned | pending environment | pending environment | Explicit dense adaptation; separate validated configurations |
 | QH-P01 | Publish the reviewed local batch for Linux handoff; QH-00 and local batch | Medium Git execution + parent review | passed: implementation pushed to origin/main | preflight/staged checks and remote SHA verification passed; existing CPU evidence retained | n/a | n/a | Reviewed task files committed and pushed to origin/main; remote commit verified; user-local instructions/logs preserved |
@@ -170,7 +175,8 @@ The [migration record](tests/docker/megatron/HYBRID.md#migration-record) records
 what existed, broke and changed in original Phantora, the Megatron update and
 the Qwen3.5 GDN run.
 
-1. Use the released Qwen3.5-9B **text decoder** as the first fidelity target.
+1. ~~Use the released Qwen3.5-9B **text decoder** as the first fidelity target.~~
+   Superseded 2026-11-22: the target is the Qwen3.5-0.8B text decoder; 9B is out of scope.
 2. Retain local Megatron projection/MLP implementations and add fused FLA GDN;
    Transformer Engine is outside the first milestone.
 3. Preserve the existing distributed optimizer, overlapping gradient reduction
@@ -232,8 +238,7 @@ the Qwen3.5 GDN run.
 | A18 | measurement requirement | Timing keys are specific to rank-local work, implementation and GPU | Reject failed/zero/stale/mixed-provenance timings; profile backward separately |
 | A19 | validation default | Report tokens from actual batch and max-rank steady-state duration | Do not use rank-0 alone or silently changed accumulation for scaling comparisons |
 | A20 | verified source implication; distributed test pending | GDN output-norm weight is shared across head shards; Core 0.16's default TP gradient finalizer does not include it when SP is off | Add/test the necessary TP SUM for this shared gradient; include its real communication in timing |
-| A21 | deliberate implementation choice | Local surrounding norm/MLP/attention work uses unfused PyTorch paths; fused bias/softmax paths disabled for hybrid observability | Timings describe this backend, including local full attention; do not claim TE or fully fused attention performance |
-| A22 | verified reference correction; fixed and CPU checked | Pinned Qwen GDN output RMSNorm normalizes in FP32, casts to input dtype before multiplying its scale, then applies the FP32 gate/final cast | Earlier FP32-through-gate assumption was incorrect; corrected local norm and BF16 roundoff regression pass. Actual GPU/model comparison remains pending |
+| A21 | deliberate implementation choice | Local surrounding norm/MLP/attention work uses unfused PyTorch paths; fused bias/softmax paths disabled for hybrid observability | Timings describe this backend, including local full attention; do not claim TE or fully fused attention performance | 2026-11-22 (QH-07ab): full attention (decoder and MTP) now uses PyTorch SDPA flash (`FlashCoreAttention`, forced backend, native GQA, implicit causal mask, no mask tensor); every run before that used the local unfused path and is labeled "unfused". Norm/MLP/bias paths stay unfused || A22 | verified reference correction; fixed and CPU checked | Pinned Qwen GDN output RMSNorm normalizes in FP32, casts to input dtype before multiplying its scale, then applies the FP32 gate/final cast | Earlier FP32-through-gate assumption was incorrect; corrected local norm and BF16 roundoff regression pass. Actual GPU/model comparison remains pending |
 | A23 | verified import requirement | FLA can probe the driver at import time | Replay must install required simulation aliases before upstream GDN imports, without initializing real FLA/Triton |
 | A24 | deliberate provenance requirement | GDN measured entries require the pinned torch revision and candidate package versions | Run the fused profiler in the matching hybrid environment; stock local torch is for CPU checks, not accepted calibration data |
 | A25 | source issue under investigation in QH-05 | Legacy scalar-pow timing ignores exponent; new norm backward can require exponent 3 | Do not conflate materially different hybrid kernels; preserve exponent-2 keys where applicable and record compatibility changes |
@@ -645,6 +650,44 @@ have been produced. Peak simulation memory remains unvalidated.
   timing keys to close it. Use seq 8192 (MB 1, GA 8) as the 0.8B timing
   comparison point: GPU-bound, 42 GiB of 98 GiB. Seq 16384 fits but with ~2 GiB
   headroom. Modeling host launch time is a separate, undecided option.
+- 2026-11-22: Target changed from Qwen3.5-9B to Qwen3.5-0.8B (user). 9B is
+  out of scope and no longer a validation gap. Earlier 9B entries (config pin,
+  `--hybrid-preset 9b`, single-GPU debug) stay as history. Rule: any 9B result
+  must name 9B explicitly; results without a model size are 0.8B.
+- 2026-11-22: MTP is part of the 0.8B target (user), as in the released
+  checkpoint (`mtp_num_hidden_layers: 1`). Headline real-vs-Phantora numbers
+  are the with-MTP ones; earlier no-MTP results stay as recorded and must be
+  labeled "no MTP".
+- 2026-11-22: `gpu01/run.sh` now defaults `--mtp` to the preset's released depth
+  (1 for `0.8b`, `0.8b-l4`, `9b`; 0 for `debug`, which has no MTP layer).
+  `--mtp 0` reproduces earlier runs. Lower layers (`simulate.py --mtp-layers`,
+  `test_megatron.py --mtp-layers`, `HybridConfig.mtp_num_layers`) still default
+  to 0; `run.sh` always passes the value explicitly. Not yet exercised on gpu01.
+- 2026-11-22: QH-07aa (MTP sweep). 24L seq 12288 (−20.4%) breaks the shrinking-error trend
+  (8192 −12.6%); suspected but unverified cause: `expandable_segments` off in the
+  24L real run at 79 GiB peak. PP + MTP fails identically in real and simulation
+  (grad-ready-count assertion on the last stage), so it is a harness/model issue,
+  not a simulator one; PP numbers with MTP are missing until it is fixed. The
+  MTP DP2 point (−12.9%) compares with the no-MTP DP runs in QH-07z (−12.7%).
+- 2026-11-22: QH-07ab. Flash attention always (user). The full-attention layers and the
+  MTP layer use `FlashCoreAttention` (tests/qwen_hybrid_model.py): PyTorch SDPA with the
+  flash backend forced, `enable_gqa` (no KV repeat), `is_causal` (no mask tensor), same
+  signature as Megatron's DotProductAttention. Hybrid data iterators no longer build the
+  seq x seq attention mask (`create_attention_mask=False`), so the per-microbatch host
+  build and H2D copy of the mask are gone in both real and simulated runs. The structure
+  check now requires flash in every full-attention and MTP layer. Megatron unchanged.
+  Checks before any run: gpu01 probe (torch 2.9.1, sm_120) picks
+  `aten::_scaled_dot_product_flash_attention` by default for head dim 256, 4 Q / 1 KV head,
+  seq 8192, causal, forward and backward, with and without GQA; cuDNN attention is not
+  compiled in; the memory-efficient kernel rejects native GQA. GPU equivalence vs an FP32
+  causal reference: relative error 2.0e-3 (output), 2.5-3.0e-3 (dQ/dK/dV) at seq 1024/8192
+  (4/1 heads) and 2048 (8/2 heads). 74 hybrid CPU tests pass (73 before + a CPU
+  flash-vs-reference test). Phantora: forward is charged at the outer
+  `aten::scaled_dot_product_attention` (handler with gqa), backward at
+  `aten::_scaled_dot_product_flash_attention_backward`; whether the simulated sm_86 device
+  selects flash, and whether both handlers match the 2.9.1 argument lists, is checked by
+  the first discovery. Expected to move: attention time and memory (no s x s scores),
+  host/H2D mask work. All earlier results stay as recorded and are "unfused".
 - Corrections to pasted specification: dense Qwen3.5 is an official target;
   dense Next is an adaptation; gated full attention and exact normalization matter;
   timing coverage must include surrounding ops and all rank-local/full-depth keys;
