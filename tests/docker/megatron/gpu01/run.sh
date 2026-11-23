@@ -12,7 +12,9 @@
 #                     so the global batch is mb * ga * dp
 #   --stage-layers L  uneven PP split, decoder layers per stage, e.g. 1,3 (default: Megatron's even split)
 #   --iterations N    training iterations (default 4; step time = mean of iterations 2..N, slower rank)
-#   --mtp N           train N multi-token-prediction layers (default 0 = off; Qwen3.5 has 1)
+#   --mtp N           train N multi-token-prediction layers (default: the preset's own depth, 1 for
+#                     0.8b/0.8b-l4/9b, 0 for debug; --mtp 0 = off, as in every run before
+#                     2026-11-22 except QH-07w)
 #   --vram-mib M      simulated GPU memory (default 97887; seq 32768 needed 131072)
 #   --sim-log LEVEL   replay simulator log level (default debug: keeps per-event charges in events.jsonl.gz)
 #   --expandable / --no-expandable   PYTORCH_CUDA_ALLOC_CONF=expandable_segments for the real run
@@ -29,7 +31,7 @@ source "$here/paths.sh"
 name=${1:?usage: run.sh <name> --preset P --seq N [options]}; shift
 [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || ph_die "name may use letters, digits, . _ - only"
 preset="" seq="" stages="discovery,profile,replay" base_db="" mb=1 ga=8 tp=2 iters=4 vram=97887
-sim_log=debug expandable="" allow_unpushed=0 mtp=0 pp=1 dp=1 stage_layers=""
+sim_log=debug expandable="" allow_unpushed=0 mtp="" pp=1 dp=1 stage_layers=""
 while (( $# )); do
     case $1 in
         --preset) preset=$2; shift 2;; --seq) seq=$2; shift 2;; --stages) stages=$2; shift 2;;
@@ -42,6 +44,7 @@ while (( $# )); do
     esac
 done
 [[ -n $preset && -n $seq ]] || ph_die "--preset and --seq are required"
+[[ -z $mtp ]] && { [[ $preset == debug ]] && mtp=0 || mtp=1; }   # the preset's released MTP depth
 [[ $mtp =~ ^[0-9]+$ ]] || ph_die "--mtp takes a non-negative integer"
 [[ $tp =~ ^[1-9][0-9]*$ && $pp =~ ^[1-9][0-9]*$ && $dp =~ ^[1-9][0-9]*$ ]] || ph_die "--tp, --pp and --dp take positive integers"
 [[ -z $stage_layers || $stage_layers =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || ph_die "--stage-layers takes e.g. 1,3"

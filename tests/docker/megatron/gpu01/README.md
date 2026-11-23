@@ -49,8 +49,10 @@ tests/docker/megatron/gpu01/run.sh <name> --preset 0.8b --seq 8192 --base-db <db
 - `--preset`: `0.8b` (24 layers) or `0.8b-l4` (4 layers); `debug` and `9b` also exist.
 - `--base-db`: the timing database to start from. It is copied into the run, never changed.
 - `--stages`: any of `discovery,profile,replay,real` (default `discovery,profile,replay`).
-- `--mtp N`: train N multi-token-prediction layers (Qwen3.5 has 1). Default 0, as in every
-  run before QH-07w; applies to the simulated and the real stages alike.
+- `--mtp N`: train N multi-token-prediction layers; applies to the simulated and the real
+  stages alike. Default (since 2026-11-22; MTP is part of the target): the preset's own
+  depth, 1 for `0.8b`, `0.8b-l4` and `9b` as in the released checkpoints, 0 for `debug`. `--mtp 0` turns it off. Every run before 2026-11-22 except
+  QH-07w used 0, so to reproduce those pass `--mtp 0`.
 - `--pp N` (default 1) and `--stage-layers 1,3` (uneven split, one decoder-layer count per
   stage; default Megatron's even split).
 - `--dp N` (default 1, as in every run before it was added): data-parallel replicas.
