@@ -4,6 +4,9 @@ The first sweep of the full target model (24 decoder layers + its one MTP layer)
 simulator and harness fix made so far. Data: [`phantora_vs_real_mtp.csv`](phantora_vs_real_mtp.csv).
 Earlier sweeps without MTP are unchanged in `../qwen35_08b_sequence_sweep/`.
 
+**A15 correction (2026-11-23):** one point's Phantora number (24L seq 12288) was overwritten after
+its profile session was found to have recorded 4 of 5 iterations. Marked in the table.
+
 ## Conditions
 
 - Commit `feb78357` via `tests/docker/megatron/gpu01/run.sh`, batch script
@@ -28,7 +31,7 @@ Earlier sweeps without MTP are unchanged in `../qwen35_08b_sequence_sweep/`.
 | 24 | TP2 | 1,024 | 328.4 | 962.9 | −65.9% | 15.0 | host-bound |
 | 24 | TP2 | 4,096 | 1,346.8 | 1,636.0 | −17.7% | 27.5 | |
 | 24 | TP2 | 8,192 | 3,300.1 | 3,776.0 | −12.6% | 49.0 | control |
-| 24 | TP2 | 12,288 | 5,353.2 | 6,729.0 | −20.4% | 78.9 | see below |
+| 24 | TP2 | 12,288 | 5,943.4 | 6,729.0 | −11.7% | 78.9 | A15-corrected (was 5,353.2, −20.4%) |
 | 24 | TP2 | 16,384 | OOM | OOM | — | — | QH-07w |
 | 4 | TP2 | 1,024 | 162.8 | 285.2 | −42.9% | 10.1 | host-bound |
 | 4 | TP2 | 4,096 | 640.3 | 798.6 | −19.8% | 16.4 | |
@@ -47,10 +50,12 @@ Earlier sweeps without MTP are unchanged in `../qwen35_08b_sequence_sweep/`.
 - Phantora is below real at every point. Error falls as the GPU dominates: 4L goes
   −19.8 → −14.7 → −11.5 → −6.5% from seq 4096 to 24576, the same trend as without MTP.
 - Host-bound sizes (seq 1024) remain far off, as expected with CPU time ignored (A1).
-- **24L seq 12288 (−20.4%) breaks the trend** (8192 gives −12.6%; no-MTP 24L 16384 gave
-  −9.3%). Not investigated. One candidate (unverified): this 24L real run had
-  `expandable_segments` off at 79 GiB peak, so allocator retries may inflate real time.
-  A rerun with `--expandable` would test it.
+- 24L seq 12288 first came out −20.4%, breaking the trend. Cause found 2026-11-23 (A15): its own
+  profile session recorded 4 of 5 iterations, so every timing it added was 0.8x. Replayed from a DB with
+  those timings re-measured by the fixed profiler (build `feb78357`, the pre-flash code), it is 5,943.4 ms,
+  −11.7%, in line with 8192 (−12.6%). The number in the table was overwritten (one-time decision, see
+  the tracker); the original stays in the CSV column `a15_original_replay_ms`. The expandable-segments
+  guess was wrong: at 24L 8192 flash, expandable on vs off changed real time by +0.2%.
 - DP2 error (−12.9%) is in line with TP2 at the same size; the no-MTP DP2 run (QH-07z, `../qwen35_data_parallel/`) gave −12.7%.
 
 ## Failure: MTP with pipeline parallelism

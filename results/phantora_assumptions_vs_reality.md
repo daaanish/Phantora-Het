@@ -30,6 +30,7 @@ Evidence rows are in `Phantora-Het/QWEN_HYBRID_TRACKER.md` under the IDs given.
 | A12 | One measured bandwidth describes all collectives | Fork's setup | All-reduce within about 50 ms of real | Acceptable at this size |
 | A13 | Simulated GPU memory behaves like real GPU memory | Original | Peak not validated (78.7 GiB simulated vs 95.6 GiB device-level at seq 16384); it did reproduce the real out-of-memory failure at 32768 | Unvalidated |
 | A14 | The flash-attention backward can be profiled through SDPA without the grouped-KV flag | Original (`tests/perfdb/bench.py`, `SDPABackward`) | Flash backward with 4 Q / 1 KV head timed via the math fallback: 21.5 ms vs 2.0 ms real per call, +1,204 ms per step at seq 8192 (replay 25% above real) | Fixed in the fork (QH-07ab, 6f881ca): flash forced, `enable_gqa` inferred from head counts; replay 3,307.2 → 2,220.7 ms (+25.0% → −16.1% vs real) |
+| A15 | Every profiled iteration is recorded, so dividing the captured kernel time by the requested iteration count is safe | Original (`tests/perfdb/bench.py` `time_kernel`) | 8 of 38 profile sessions (2026-11-22/23) recorded 4 of 5 iterations: every bench.py key 0.80x (fused GDN keys from another script unaffected); 11 sweep points 4–9 points too low vs real | Fixed in the fork (c98260c); all 38 sessions re-timed, affected points corrected (QH-07ad) |
 
 ## Details
 
@@ -197,3 +198,34 @@ before the call. Workloads that repeat K/V to the query head count first never
 reach it. Upstream's SDPA forward key already records `gqa`; only the backward
 key and its profiler dropped it. Not specific to Qwen or to the hybrid fork;
 our flash module is simply the first workload here to use native GQA.
+
+### A15. Profiler assumes every iteration was recorded
+
+`bench.py` times a key by profiling 5 back-to-back calls (`--iters 5`) and dividing the summed kernel
+time by 5. In the QH-07ac flash sweep, five depths each profiled the same 171 new keys at seq 16384 and
+again at 24576, ten sessions in all. Eight sessions agree within 1–2% on every key. Two (16 layers at
+16384, 24 layers at 24576) are 0.80x the median of the others on every bench.py key: compute keys,
+matmuls and FP32 elementwise alike (0.81 and 0.80 medians), and their memcpy keys (0.80). The fused GDN
+keys, profiled in the same session on the same GPU by `gdn_profile.py`, are 1.00. A GPU clock or thermal
+state would have slowed those too, so the cause is the measurement: 0.80 is exactly 4/5, i.e. the
+profiler recorded the kernels of only 4 of the 5 iterations, for every key in the session. bench.log
+shows no warning. Why some sessions lose an iteration is not established (likely a CUPTI/Kineto
+capture boundary at start or stop).
+
+Effect: those two points' replays came out −21.9% (16 layers, 16384) and −15.7% (24 layers, 24576)
+against real, where their neighbors are about −15% and −8%. The real runs reproduce (16 layers, 16384:
+4,549.9 ms sweep, 4,570.9 ms phase pass), so the outliers are on Phantora's side. An earlier reading in
+this entry (that only memory-bound keys were off, and that clocks or L2 might explain it) was wrong:
+all bench.py keys are off by the same factor and the GDN keys are not.
+
+Fix in the fork: `time_kernel` launches a marker kernel (`torch.cuda._sleep`) before and after every
+iteration, averages only complete iterations between captured markers (iterations with an unusual kernel
+count are dropped), logs any short capture and refuses to store a timing from fewer than 3 iterations.
+Correction: every key the 38 profile sessions of 2026-11-22/23 measured was re-timed in one session
+with the old and fixed bench.py back to back (`gpu01:~/Phantora/reprofile-20261123`). The old code lost
+an iteration again there (old/new 0.807); the fixed code reported no short capture. 30 sessions agree
+with the fixed timings within ~1%; 8 sessions are 0.80–0.81. Affected points were replayed from DB copies
+with only those sessions' timings replaced, and their numbers in the results tables were overwritten
+(one-time user decision); e.g. 24L 24k −15.7% → −7.5%, 16L 16k −21.9% → −14.7%, unfused 24L 12k
+−20.4% → −11.7%, 4L 32k −17.2% → −10.2%. Repeating iterations inside one session would not have
+helped: the loss was per session and uniform. Evidence: QH-07ad.
