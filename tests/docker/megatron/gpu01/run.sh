@@ -24,6 +24,9 @@
 #   --sim-log LEVEL   replay simulator log level (default debug: keeps per-event charges in events.jsonl.gz)
 #   --expandable / --no-expandable   PYTORCH_CUDA_ALLOC_CONF=expandable_segments for the real run
 #                     (default: on for the reduced-depth 0.8b-l* presets, off otherwise)
+#   --no-compile-cache  real runs compile into a fresh per-run cache (as before 2026-11-23) instead
+#                     of $PH_CACHE/real-compile/<torch build>/ (Triton, Inductor, CUDA JIT), which is
+#                     kept across runs. Step time excludes iteration 0, where compilation happens.
 #   --allow-unpushed  run even if the clone's HEAD is not on its upstream branch
 #
 # Output: $PH_RUNS/<YYYYmmdd-HHMMSS>-<name>-<commit8>/  (commit.txt, config.json, build.json,
@@ -36,7 +39,7 @@ source "$here/paths.sh"
 name=${1:?usage: run.sh <name> --preset P --seq N [options]}; shift
 [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || ph_die "name may use letters, digits, . _ - only"
 preset="" seq="" stages="discovery,profile,replay" base_db="" mb=1 ga=8 tp=2 iters=4 vram=97887
-sim_log=debug expandable="" allow_unpushed=0 mtp="" pp=1 dp=1 stage_layers="" phases=0
+sim_log=debug expandable="" allow_unpushed=0 mtp="" pp=1 dp=1 stage_layers="" phases=0 compile_cache=1
 while (( $# )); do
     case $1 in
         --preset) preset=$2; shift 2;; --seq) seq=$2; shift 2;; --stages) stages=$2; shift 2;;
@@ -45,6 +48,7 @@ while (( $# )); do
         --sim-log) sim_log=$2; shift 2;; --expandable) expandable=1; shift;; --no-expandable) expandable=0; shift;;
         --allow-unpushed) allow_unpushed=1; shift;; --mtp) mtp=$2; shift 2;;
         --phases) phases=1; shift;;
+        --no-compile-cache) compile_cache=0; shift;;
         --pp) pp=$2; shift 2;; --dp) dp=$2; shift 2;; --stage-layers) stage_layers=$2; shift 2;;
         *) ph_die "unknown option $1";;
     esac
@@ -90,7 +94,8 @@ json.dump(dict(name="$name", commit="$commit", preset="$preset", sequence_length
                pipeline_stage_layers=[int(x) for x in "$stage_layers".split(",")] if "$stage_layers" else None,
                world_size=$world, iterations=$iters, vram_mib=$vram, mtp_layers=$mtp,
                stages="$stages".split(","), base_db="$base_db" or None, sim_log_level="$sim_log",
-               real_expandable_segments=bool($expandable), host="$(hostname)"), open(sys.argv[1], "w"), indent=1)
+               real_expandable_segments=bool($expandable), real_compile_cache=bool($compile_cache),
+               host="$(hostname)"), open(sys.argv[1], "w"), indent=1)
 P
 ph_log "run $run: $preset seq $seq, tp $tp pp $pp dp $dp${stage_layers:+ split $stage_layers}, mtp $mtp, stages $stages, commit ${commit:0:8}"
 scratch=$(mktemp -d "$PH_SCRATCH/ph-run-XXXXXX")
@@ -160,7 +165,16 @@ if has replay; then
 fi
 
 real_pass() {  # <stage dir: real | phases-real> [phases]
-    local r="$run/$1" rc=0; mkdir -p "$r" "$scratch/rcache"
+    local r="$run/$1" rc=0 cbind="" cenv="" t0=$SECONDS; mkdir -p "$r" "$scratch/rcache"
+    if (( compile_cache )); then
+        local cdir="$PH_CACHE/real-compile/$(basename "$torch_dir")"; mkdir -p "$cdir"
+        local state=cold; [[ -n "$(ls -A "$cdir" 2>/dev/null)" ]] && state=warm
+        echo "$cdir $state" > "$r/compile_cache"
+        cbind=",$cdir:/qh-compile" cenv=/qh-compile
+        ph_log "$1: compile cache $state ($cdir)"
+    else
+        echo "per-run" > "$r/compile_cache"
+    fi
     idx=$(seq -s, 0 $((world - 1)))
     (( $(nvidia-smi --query-gpu=uuid --format=csv,noheader | wc -l) >= world )) || ph_die "real needs $world GPUs"
     ph_log "$1: waiting for GPUs $idx"
@@ -172,14 +186,15 @@ real_pass() {  # <stage dir: real | phases-real> [phases]
     APPTAINERENV_QH_PRESET=$preset APPTAINERENV_QH_SEQ=$seq APPTAINERENV_QH_MB=$mb APPTAINERENV_QH_GBS=$((mb * ga * dp)) \
     APPTAINERENV_QH_ITERS=$iters APPTAINERENV_QH_EXPANDABLE=$expandable APPTAINERENV_QH_MTP=$mtp \
     APPTAINERENV_QH_PP=$pp APPTAINERENV_QH_DP=$dp APPTAINERENV_QH_STAGE_LAYERS="$stage_layers" \
-    APPTAINERENV_QH_REAL_DIR="$1" APPTAINERENV_QH_PHASES="${2:-}" \
+    APPTAINERENV_QH_REAL_DIR="$1" APPTAINERENV_QH_PHASES="${2:-}" APPTAINERENV_QH_COMPILE_CACHE="$cenv" \
         timeout -k 25 3600 apptainer exec --containall --cleanenv --nv \
-        --bind "$binds_common,$scratch/rcache:/qh-cache" --pwd /qh-run "$PH_SIF" bash "/qh-src/tests/docker/megatron/gpu01/real_inside.sh" \
+        --bind "$binds_common,$scratch/rcache:/qh-cache$cbind" --pwd /qh-run "$PH_SIF" bash "/qh-src/tests/docker/megatron/gpu01/real_inside.sh" \
         > "$r/trainer.log" 2>&1 || rc=$?
     kill "$mon" 2>/dev/null || true
     echo "$rc" > "$r/exit"
     [[ -n ${2:-} ]] && python3 "$g/phases.py" --ranks "$world" "$r"/ranks/*/*/*/stdout.log > "$r/phases.json"
-    ph_log "$1 exit $rc: $(python3 "$g/metrics.py" --ranks "$world" "$r"/ranks/*/*/*/stdout.log) ms; peak $(sort -t, -k1 -n "$r/mem.csv" | tail -1) MiB"
+    echo $((SECONDS - t0)) > "$r/wall_s"   # whole stage incl. container start and compilation
+    ph_log "$1 exit $rc ($((SECONDS - t0)) s): $(python3 "$g/metrics.py" --ranks "$world" "$r"/ranks/*/*/*/stdout.log) ms; peak $(sort -t, -k1 -n "$r/mem.csv" | tail -1) MiB"
 }
 
 if has real; then real_pass real; fi
@@ -215,6 +230,9 @@ if (run / "profile" / "merge.json").exists():
 if (run / "real").exists():
     s["real"] = dict(exit=(run / "real" / "exit").read_text().strip(),
                      step_ms=ms(sorted((run / "real").glob("ranks/*/*/*/stdout.log"))))
+    for name, f in (("wall_s", "wall_s"), ("compile_cache", "compile_cache")):
+        if (run / "real" / f).exists():
+            s["real"][name] = (run / "real" / f).read_text().strip()
 for stage in ("phases-sim", "phases-real"):
     f = run / stage / "phases.json"
     if f.exists():

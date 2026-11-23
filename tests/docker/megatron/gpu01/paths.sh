@@ -5,6 +5,7 @@ PH_CLONE="$PH_ROOT/Phantora-Het"              # git clone of daaanish/Phantora-H
 PH_ENV="$PH_ROOT/env"                         # one-time copies of external dependencies (setup_env.sh)
 PH_BUILDS="$PH_ROOT/builds"                   # <commit>/ native builds, torch-<commit>/ torch builds
 PH_RUNS="$PH_ROOT/runs"                       # one directory per run, named <date>-<name>-<commit8>
+PH_CACHE="$PH_ROOT/cache"                     # real-compile/<torch build>/: Triton/Inductor/CUDA JIT caches kept across real runs
 PH_SIF="$PH_ROOT/Phantora/phantora-gpu01.sif" # base image: CUDA 12.8, Python 3.11, Megatron, Rust
 PH_HOST="gpu01.pronet.rcac.purdue.edu"
 PH_GPU_NAME="NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"

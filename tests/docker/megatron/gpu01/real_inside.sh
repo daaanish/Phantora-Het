@@ -2,7 +2,10 @@
 set -euxo pipefail
 unset PHANTORA LD_PRELOAD PHANTORA_COVERAGE
 export HOME=/qh-cache/home TMPDIR=/qh-cache/tmp PYTHONDONTWRITEBYTECODE=1 PIP_CONFIG_FILE=/dev/null
-export TRITON_CACHE_DIR=/qh-cache/triton TORCHINDUCTOR_CACHE_DIR=/qh-cache/inductor CUDA_CACHE_PATH=/qh-cache/cuda
+# Compile caches: /qh-compile is kept across real runs of the same torch build (run.sh, default),
+# or the per-run /qh-cache with --no-compile-cache. Only compiled-kernel caches go there.
+cc=${QH_COMPILE_CACHE:-/qh-cache}
+export TRITON_CACHE_DIR=$cc/triton TORCHINDUCTOR_CACHE_DIR=$cc/inductor CUDA_CACHE_PATH=$cc/cuda
 export TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda/bin/ptxas
 export LD_LIBRARY_PATH="/qh-torch/torch/lib:$LD_LIBRARY_PATH"
 export PYTHONPATH=/qh-torch:/qh-causal:/qh-upgraded:/qh-src/tests PATH="/qh-upgraded/bin:$PATH"

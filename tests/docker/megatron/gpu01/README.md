@@ -62,6 +62,11 @@ tests/docker/megatron/gpu01/run.sh <name> --preset 0.8b --seq 8192 --base-db <db
   `phases.json` (per rank and slowest-rank ms per step, iteration 0 excluded) and is copied
   into `summary.json`. Timers nest: `forward-backward` contains `forward-compute`,
   `backward-compute` and `all-grads-sync`; `optimizer-*` and `params-all-gather` follow it.
+- `--no-compile-cache`: since 2026-11-23 real runs (`real`, `phases-real`) keep Triton, Inductor
+  and CUDA JIT caches in `~/Phantora/cache/real-compile/<torch build>/` across runs, so step 1
+  no longer recompiles every kernel. Step time excludes iteration 0 either way. This flag gives
+  the old fresh per-run cache. Each real stage records `compile_cache` (path and cold/warm, or
+  `per-run`) and `wall_s` (whole stage) in its directory and in `summary.json`.
 - `--pp N` (default 1) and `--stage-layers 1,3` (uneven split, one decoder-layer count per
   stage; default Megatron's even split).
 - `--dp N` (default 1, as in every run before it was added): data-parallel replicas.
