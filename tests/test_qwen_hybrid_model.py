@@ -10,7 +10,7 @@ import torch
 
 from qwen_hybrid_config import DEBUG_MODEL, HybridConfig, configure_hybrid_args
 from qwen_hybrid_model import (
-    GDNOutputRMSNorm, QwenRMSNorm, build_hybrid_mtp_spec, build_hybrid_spec,
+    FlashCoreAttention, GDNOutputRMSNorm, QwenRMSNorm, build_hybrid_mtp_spec, build_hybrid_spec,
     finalize_hybrid_grads, require_hybrid_kernels, transformer_overrides, validate_hybrid_structure,
 )
 
@@ -50,11 +50,16 @@ class HybridModelTests(unittest.TestCase):
                 attention.linear_proj = SimpleNamespace(weight=torch.empty(dims.hidden_size, dims.num_attention_heads * dims.head_dim))
                 attention.q_layernorm = SimpleNamespace(weight=torch.empty(dims.head_dim))
                 attention.k_layernorm = SimpleNamespace(weight=torch.empty(dims.head_dim))
+                attention.core_attention = FlashCoreAttention.__new__(FlashCoreAttention)
             mlp = SimpleNamespace(linear_fc1=SimpleNamespace(weight=torch.empty(2 * workload.model.ffn_hidden_size, workload.model.hidden_size)),
                 linear_fc2=SimpleNamespace(weight=torch.empty(workload.model.hidden_size, workload.model.ffn_hidden_size)))
             layers.append(SimpleNamespace(layer_number=index + 1, self_attention=attention, mlp=mlp))
         model = SimpleNamespace(decoder=SimpleNamespace(layers=layers))
         self.assertEqual(len(validate_hybrid_structure(model, workload, 0)), 4)
+        full = next(layer.self_attention for layer in layers if not isinstance(layer.self_attention, GatedDeltaNet))
+        flash, full.core_attention = full.core_attention, SimpleNamespace()   # e.g. Megatron's unfused path
+        with self.assertRaisesRegex(RuntimeError, "FlashCoreAttention"): validate_hybrid_structure(model, workload, 0)
+        full.core_attention = flash
         layers[0].layer_number = 99
         with self.assertRaises(RuntimeError): validate_hybrid_structure(model, workload, 0)
 
@@ -150,6 +155,7 @@ class HybridModelTests(unittest.TestCase):
             else:
                 self.assertIs(attention.submodules.q_layernorm, QwenRMSNorm)
                 self.assertIs(attention.submodules.k_layernorm, QwenRMSNorm)
+                self.assertIs(attention.submodules.core_attention, FlashCoreAttention)
 
     def test_mtp_spec_is_qwen_full_attention_on_last_stage_only(self):
         class GDN: pass
@@ -187,6 +193,7 @@ class HybridModelTests(unittest.TestCase):
         self.assertIs(sub.eh_proj, Column)
         self.assertEqual(sub.transformer_layer.submodules.self_attention.module, "full")
         self.assertIs(sub.transformer_layer.submodules.self_attention.submodules.q_layernorm, QwenRMSNorm)
+        self.assertIs(sub.transformer_layer.submodules.self_attention.submodules.core_attention, FlashCoreAttention)
         self.assertIs(sub.transformer_layer.submodules.input_layernorm, QwenRMSNorm)
 
     def test_structure_guard_checks_mtp_block(self):
@@ -196,7 +203,8 @@ class HybridModelTests(unittest.TestCase):
         def full_layer():
             attention = SimpleNamespace(
                 linear_qkv=SimpleNamespace(weight=torch.empty((2 * dims.num_attention_heads + 2 * dims.num_query_groups) * dims.head_dim, dims.hidden_size)),
-                q_layernorm=SimpleNamespace(weight=torch.empty(dims.head_dim)))
+                q_layernorm=SimpleNamespace(weight=torch.empty(dims.head_dim)),
+                core_attention=FlashCoreAttention.__new__(FlashCoreAttention))
             mlp = SimpleNamespace(linear_fc1=SimpleNamespace(weight=torch.empty(2 * dims.ffn_hidden_size, dims.hidden_size)))
             return SimpleNamespace(self_attention=attention, mlp=mlp)
         config = SimpleNamespace(params_dtype=torch.float32, sequence_parallel=False, use_cpu_initialization=True)
@@ -212,11 +220,43 @@ class HybridModelTests(unittest.TestCase):
             bare.mtp = SimpleNamespace(layers=[mtp_layer])
             checked = validate_hybrid_structure(bare, no_layers, 0)
             self.assertEqual(checked, [dict(mtp_depth=0, kind="mtp_full_attention")])
+            attention = mtp_layer.transformer_layer.self_attention
+            flash, attention.core_attention = attention.core_attention, SimpleNamespace()
+            with self.assertRaisesRegex(RuntimeError, "MTP attention must use FlashCoreAttention"):
+                validate_hybrid_structure(bare, no_layers, 0)
+            attention.core_attention = flash
             mtp_layer.hnorm = SimpleNamespace()
             with self.assertRaisesRegex(RuntimeError, "hnorm"):
                 validate_hybrid_structure(bare, no_layers, 0)
             with self.assertRaisesRegex(RuntimeError, "should not own"):
                 validate_hybrid_structure(bare, replace(no_layers, mtp_num_layers=0), 0)
+
+    def test_flash_core_attention_matches_causal_gqa_reference_and_rejects_unsupported(self):
+        import enum, math
+        class AttnMaskType(enum.Enum):
+            causal = 1
+            padding = 2
+        modules = fake_modules({"megatron.core.transformer.enums": {"AttnMaskType": AttnMaskType}})
+        config = SimpleNamespace(attention_dropout=0.0, context_parallel_size=1)
+        with patch.dict(sys.modules, modules):
+            attention = FlashCoreAttention(config, 1, AttnMaskType.causal, None)
+            for bad_config, mask in ((SimpleNamespace(attention_dropout=0.1, context_parallel_size=1), AttnMaskType.causal),
+                                     (SimpleNamespace(attention_dropout=0.0, context_parallel_size=2), AttnMaskType.causal),
+                                     (config, AttnMaskType.padding)):
+                with self.assertRaises(ValueError):
+                    FlashCoreAttention(bad_config, 1, mask, None)
+        torch.manual_seed(0)
+        sq, b, heads, groups, d = 16, 2, 4, 2, 8   # [s, b, h, d], grouped KV
+        q, k, v = torch.randn(sq, b, heads, d), torch.randn(sq, b, groups, d), torch.randn(sq, b, groups, d)
+        out = attention(q, k, v, None)
+        self.assertEqual(out.shape, (sq, b, heads * d))
+        kr, vr = k.repeat_interleave(heads // groups, 2), v.repeat_interleave(heads // groups, 2)
+        scores = torch.einsum("sbhd,tbhd->bhst", q, kr) / math.sqrt(d)
+        scores = scores.masked_fill(torch.ones(sq, sq, dtype=torch.bool).triu(1), float("-inf"))
+        reference = torch.einsum("bhst,tbhd->sbhd", scores.softmax(-1), vr).reshape(sq, b, heads * d)
+        torch.testing.assert_close(out, reference, rtol=1e-4, atol=1e-5)
+        with self.assertRaises(ValueError):
+            attention(q, k, v, None, attention_bias=torch.zeros(1))
 
     def test_finalize_keeps_megatron_and_sums_only_gdn_scale(self):
         grad = torch.ones(8)

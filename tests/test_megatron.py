@@ -264,7 +264,7 @@ def iter_model_chunks(model):
     return model if isinstance(model, list) else [model]
 
 
-def get_train_data_iterator(vocab_size, micro_batch_size, sequence_length):
+def get_train_data_iterator(vocab_size, micro_batch_size, sequence_length, create_attention_mask=True):
     config = GPTDatasetConfig(
         random_seed=42,
         sequence_length=sequence_length,
@@ -272,6 +272,8 @@ def get_train_data_iterator(vocab_size, micro_batch_size, sequence_length):
         reset_attention_mask=False,
         eod_mask_loss=False,
         tokenizer=NullTokenizer(vocab_size-1),
+        # Hybrid runs use causal flash attention, which needs no seq x seq mask tensor.
+        create_attention_mask=create_attention_mask,
     )
     config.mock = True
     datasets = BlendedMegatronDatasetBuilder(
@@ -294,7 +296,7 @@ def forward_step_func(device, data_iterator, model):
 
     data = next(data_iterator)
     tokens = data["tokens"].to(device)
-    attention_mask = data["attention_mask"].to(device)
+    attention_mask = data["attention_mask"].to(device) if "attention_mask" in data else None
     position_ids = data["position_ids"].to(device)
     labels = data["labels"].to(device)
     loss_mask = data["loss_mask"].to(device)
@@ -468,7 +470,7 @@ def main(
             tokens_per_iteration=hybrid_config.tokens_per_iteration,
             source=HYBRID_CONFIG_SOURCES.get(hybrid_config.model, "synthetic debug dimensions"),
             memory_validated=False,
-            full_attention_backend="local_unfused",
+            full_attention_backend="sdpa_flash",
         ), sort_keys=True), flush=True)
 
     duras = []
@@ -480,11 +482,12 @@ def main(
         region.start_observer()
         region.emit("start")
     for i in range(iterations):
+        mask = hybrid_config is None   # hybrid full attention is flash (causal, no mask tensor)
         if virtual_pipeline_model_parallel_size is None:
-            train_iterator = get_train_data_iterator(vocab_size, micro_batch_size, sequence_length)
+            train_iterator = get_train_data_iterator(vocab_size, micro_batch_size, sequence_length, mask)
         else:
             train_iterator = [
-                get_train_data_iterator(vocab_size, micro_batch_size, sequence_length)
+                get_train_data_iterator(vocab_size, micro_batch_size, sequence_length, mask)
                 for _ in range(virtual_pipeline_model_parallel_size)
             ]
         if prefetch:

@@ -38,6 +38,48 @@ class GDNOutputRMSNorm(QwenRMSNorm):
         return self.weight * value.to(x.dtype)
 
 
+class FlashCoreAttention(nn.Module):
+    """Causal flash attention for the full-attention layers (and the MTP layer).
+
+    Replaces Megatron's local unfused DotProductAttention (baddbmm -> softmax -> bmm with an
+    s x s score matrix) with PyTorch SDPA on the flash backend, which is what real Qwen3.5
+    training uses. The backend is forced, so a host or simulator that cannot run flash fails
+    loudly instead of silently switching kernels. Grouped KV heads go to the kernel natively
+    (enable_gqa) without the repeat_interleave copies of the unfused path. The causal mask is
+    implicit (is_causal); no mask tensor is read. Same signature as DotProductAttention.
+    """
+
+    def __init__(self, config, layer_number, attn_mask_type, attention_type,
+                 attention_dropout=None, softmax_scale=None, cp_comm_type=None,
+                 pg_collection=None, **_):
+        super().__init__()
+        from megatron.core.transformer.enums import AttnMaskType
+        if attn_mask_type != AttnMaskType.causal:
+            raise ValueError(f"FlashCoreAttention supports causal masks only, got {attn_mask_type}")
+        dropout = config.attention_dropout if attention_dropout is None else attention_dropout
+        if dropout:
+            raise ValueError("FlashCoreAttention assumes attention_dropout == 0")
+        if getattr(config, "context_parallel_size", 1) != 1:
+            raise ValueError("FlashCoreAttention does not support context parallelism")
+        self.config = config
+        self.softmax_scale = softmax_scale  # None = 1/sqrt(head_dim), Megatron's default too
+
+    def forward(self, query, key, value, attention_mask=None, attn_mask_type=None,
+                attention_bias=None, packed_seq_params=None):
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        if attention_bias is not None or packed_seq_params is not None:
+            raise ValueError("FlashCoreAttention supports neither attention_bias nor packed sequences")
+        sq, b, heads, head_dim = query.shape
+        # [s, b, h, d] -> [b, h, s, d]
+        q, k, v = (t.permute(1, 2, 0, 3) for t in (query, key, value))
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, is_causal=True, scale=self.softmax_scale,
+                enable_gqa=k.shape[1] != heads)
+        # [b, h, s, d] -> [s, b, h * d]
+        return out.permute(2, 0, 1, 3).reshape(sq, b, heads * head_dim)
+
+
 def require_hybrid_kernels():
     if os.environ.get("PHANTORA") is not None:
         from qwen_hybrid_kernels import install_simulation_kernels
@@ -97,6 +139,8 @@ def _layer_spec(base, layer_type):
         attention = layer.submodules.self_attention.submodules
         attention.q_layernorm = QwenRMSNorm
         attention.k_layernorm = QwenRMSNorm
+        # Flash attention always (since 2026-11-22); earlier runs used Megatron's local unfused path.
+        attention.core_attention = FlashCoreAttention
     return layer
 
 
@@ -188,6 +232,8 @@ def validate_hybrid_structure(model, workload, pp_rank):
             shape(attention.linear_proj.weight, (dims.hidden_size, dims.num_attention_heads * dims.head_dim // tp), "attention projection")
             shape(attention.q_layernorm.weight, (dims.head_dim,), "Q norm")
             shape(attention.k_layernorm.weight, (dims.head_dim,), "K norm")
+            if not isinstance(attention.core_attention, FlashCoreAttention):
+                raise RuntimeError("hybrid full attention must use FlashCoreAttention")
         checked.append(dict(global_layer=global_index, kind=kind))
     mtp = getattr(model, "mtp", None)
     owns_mtp = workload.mtp_num_layers and pp_rank == workload.pipeline_parallel_size - 1
@@ -208,6 +254,8 @@ def validate_hybrid_structure(model, workload, pp_rank):
             raise RuntimeError("hybrid MTP layer must use full attention")
         shape(attention.linear_qkv.weight, ((2 * dims.num_attention_heads + 2 * dims.num_query_groups) * dims.head_dim // tp, dims.hidden_size), "MTP gated QKV")
         shape(attention.q_layernorm.weight, (dims.head_dim,), "MTP Q norm")
+        if not isinstance(attention.core_attention, FlashCoreAttention):
+            raise RuntimeError("hybrid MTP attention must use FlashCoreAttention")
         shape(layer.mlp.linear_fc1.weight, (2 * dims.ffn_hidden_size // tp, dims.hidden_size), "MTP SwiGLU fc1")
         checked.append(dict(mtp_depth=depth, kind="mtp_full_attention"))
     return checked
