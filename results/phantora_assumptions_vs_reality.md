@@ -29,7 +29,7 @@ Evidence rows are in `Phantora-Het/QWEN_HYBRID_TRACKER.md` under the IDs given.
 | A11 | Preparing input data inside the timed step is free | Test harness, original and fork | 163 ms stall at the start of every real step | Fixed in the harness (prefetch) |
 | A12 | One measured bandwidth describes all collectives | Fork's setup | All-reduce within about 50 ms of real | Acceptable at this size |
 | A13 | Simulated GPU memory behaves like real GPU memory | Original | Peak not validated (78.7 GiB simulated vs 95.6 GiB device-level at seq 16384); it did reproduce the real out-of-memory failure at 32768 | Unvalidated |
-| A14 | The flash-attention backward can be profiled through SDPA without the grouped-KV flag | Original (`tests/perfdb/bench.py`, `SDPABackward`) | Flash backward with 4 Q / 1 KV head timed via the math fallback: 21.5 ms vs 2.0 ms real per call, +1,204 ms per step at seq 8192 (replay 25% above real) | Fixed in the fork (QH-07ab): flash forced, `enable_gqa` inferred from head counts; replay rerun pending |
+| A14 | The flash-attention backward can be profiled through SDPA without the grouped-KV flag | Original (`tests/perfdb/bench.py`, `SDPABackward`) | Flash backward with 4 Q / 1 KV head timed via the math fallback: 21.5 ms vs 2.0 ms real per call, +1,204 ms per step at seq 8192 (replay 25% above real) | Fixed in the fork (QH-07ab, 6f881ca): flash forced, `enable_gqa` inferred from head counts; replay 3,307.2 → 2,220.7 ms (+25.0% → −16.1% vs real) |
 
 ## Details
 
@@ -182,7 +182,8 @@ Fix in the fork: build the graph under `sdpa_kernel(FLASH_ATTENTION)` with
 `enable_gqa = k heads != q heads`. Checked on gpu01: the key times 2.09 ms
 (was 22.2 ms); an equal-heads key is unchanged (2.12 vs 2.13 ms), so earlier
 non-GQA timings stay valid. Affects any GQA model with flash attention, not only
-Qwen. Evidence: QH-07ab.
+Qwen. Rerun with the fix: replay 2,220.7 ms vs 2,645.7 ms real (−16.1%), from
++25.0%. Evidence: QH-07ab.
 
 Scope (checked 2026-11-22). The code is unchanged from upstream: `bench.py`
 `SDPABackward` in `Phantora-Vanilla/Phantora-main` (301d9d9) is identical. It
