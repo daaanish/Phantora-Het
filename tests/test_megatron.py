@@ -235,13 +235,14 @@ def get_model(
     return model
 
 
-def get_optimizer(model):
+def get_optimizer(model, timers=None):
     optim_config = OptimizerConfig(
         optimizer="adam",
         lr=5e-5,
         bf16=True,
         use_distributed_optimizer=True,
         clip_grad=0.0,  # no grad clipping because norm depends on communication and can cause error in simulation
+        timers=timers,
     )
 
     model_chunks = model if isinstance(model, list) else [model]
@@ -335,7 +336,10 @@ def main(
     hybrid_config=None,
     prefetch=True,
     pipeline_stage_layers=None,
+    phase_timings=False,
 ):
+    if phase_timings and iterations < 2:
+        raise ValueError("Phase timings require at least two iterations (one warmup)")
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -452,7 +456,21 @@ def main(
             for p in model_chunk.parameters()
         )
         print(f"Model size: {model_size}")
-    optim = get_optimizer(model)
+    timers = None
+    if phase_timings:
+        # Megatron's own phase timers, as in vanilla Phantora's --phase_timings (Llama/GPT phase
+        # study): attached through the model config and the optimizer config, Megatron unchanged.
+        # They synchronize CUDA at every start/stop (and barrier at level 1), so they change
+        # overlap and step time: use a separate pass, never the headline timing run.
+        from types import SimpleNamespace
+        import megatron.core.timers as timer_module
+        # Read Phantora's simulated clock in simulation; replaces only this module's clock.
+        clock = lambda: time_pair()[0]
+        timer_module.time = SimpleNamespace(time=clock, perf_counter=clock)
+        timers = timer_module.Timers(log_level=2, log_option="all")
+        for model_chunk in iter_model_chunks(model):
+            model_chunk.config.timers = timers
+    optim = get_optimizer(model, timers=timers)
 
     pp_size = pipeline_model_parallel_size
     num_microbatches = gradient_accumulation if hybrid_config is not None else (
@@ -482,6 +500,9 @@ def main(
         region.start_observer()
         region.emit("start")
     for i in range(iterations):
+        if timers is not None and i == 1:
+            for timer in timers._timers.values():   # exclude the warmup iteration 0
+                timer.reset()
         mask = hybrid_config is None   # hybrid full attention is flash (causal, no mask tensor)
         if virtual_pipeline_model_parallel_size is None:
             train_iterator = get_train_data_iterator(vocab_size, micro_batch_size, sequence_length, mask)
@@ -549,6 +570,18 @@ def main(
             tokens_per_iteration=hybrid_config.tokens_per_iteration,
             iterations=iterations, memory_validated=False,
         ), sort_keys=True), flush=True)
+    if timers is not None:
+        # Per-rank output, no extra collectives just for reporting. Timers can nest
+        # (forward-backward contains forward-compute, backward-compute and all-grads-sync).
+        phases = {name: timer.elapsed(reset=False) * 1000 / (iterations - 1)
+                  for name, timer in sorted(timers._timers.items())}
+        for name, ms in phases.items():
+            print(f"PHASE rank {rank} {name}: {ms:.3f} ms/step", flush=True)
+        if hybrid_config is not None:
+            print("HYBRID_PHASES " + json.dumps(dict(
+                version=1, run_id=os.environ.get("PHANTORA_RUN_ID"), rank=rank,
+                iterations_averaged=iterations - 1, ms_per_step=phases,
+                durations=duras), sort_keys=True), flush=True)
     peak_vram_mib = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
     print(f"Rank {rank} Time: {duras} Avg Time: {sum(duras[1:]) / (iterations - 1):.2f}\n", end="")
     memory_label = " Peak (unvalidated hybrid memory)" if hybrid_config is not None else " Peak"
@@ -566,6 +599,8 @@ if __name__ == "__main__":
     parser.add_argument("--hybrid-preset", choices=HYBRID_PRESETS, default=None)
     parser.add_argument("--mtp-layers", type=int, default=0,
         help="Train this many multi-token-prediction layers (hybrid presets only; Qwen3.5 has 1). Default 0 = off.")
+    parser.add_argument("--phase_timings", action="store_true",
+        help="Megatron phase timers (excluding iteration 0); synchronizes CUDA, so run as a separate pass.")
     parser.add_argument("--global_batch_size", type=int, default=None)
     parser.add_argument("--data_parallel_size", type=int, default=None)
     parser.add_argument("--tensor_parallel_size", type=int, default=4)
@@ -667,5 +702,6 @@ if __name__ == "__main__":
         hybrid_config=hybrid_config,
         prefetch=not args.no_prefetch_batches,
         pipeline_stage_layers=args.pipeline_stage_layers,
+        phase_timings=args.phase_timings,
     )
     disable_function_tracer()

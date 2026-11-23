@@ -2,7 +2,12 @@
 # Run one configuration against the commit checked out in $PH_CLONE. See README.md.
 #
 # usage: run.sh <name> --preset P --seq N [options]
-#   --stages LIST     comma list from: discovery,profile,replay,real   (default discovery,profile,replay)
+#   --stages LIST     comma list from: discovery,profile,replay,real,phases-sim,phases-real
+#                     (default discovery,profile,replay)
+#   --phases          append phases-sim,phases-real: separate passes with Megatron phase timers
+#                     (forward/backward/optimizer/grad sync). The timers synchronize CUDA, so they
+#                     never run in the headline discovery/replay/real stages. phases-sim replays with
+#                     the run's db (or --base-db); phases-real is a second real run.
 #   --base-db DIR     perf DB to start from (required for discovery/replay); copied, never modified
 #   --mb N            micro-batch size (default 1)
 #   --ga N            gradient accumulation (default 8)
@@ -31,7 +36,7 @@ source "$here/paths.sh"
 name=${1:?usage: run.sh <name> --preset P --seq N [options]}; shift
 [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || ph_die "name may use letters, digits, . _ - only"
 preset="" seq="" stages="discovery,profile,replay" base_db="" mb=1 ga=8 tp=2 iters=4 vram=97887
-sim_log=debug expandable="" allow_unpushed=0 mtp="" pp=1 dp=1 stage_layers=""
+sim_log=debug expandable="" allow_unpushed=0 mtp="" pp=1 dp=1 stage_layers="" phases=0
 while (( $# )); do
     case $1 in
         --preset) preset=$2; shift 2;; --seq) seq=$2; shift 2;; --stages) stages=$2; shift 2;;
@@ -39,11 +44,13 @@ while (( $# )); do
         --tp) tp=$2; shift 2;; --iterations) iters=$2; shift 2;; --vram-mib) vram=$2; shift 2;;
         --sim-log) sim_log=$2; shift 2;; --expandable) expandable=1; shift;; --no-expandable) expandable=0; shift;;
         --allow-unpushed) allow_unpushed=1; shift;; --mtp) mtp=$2; shift 2;;
+        --phases) phases=1; shift;;
         --pp) pp=$2; shift 2;; --dp) dp=$2; shift 2;; --stage-layers) stage_layers=$2; shift 2;;
         *) ph_die "unknown option $1";;
     esac
 done
 [[ -n $preset && -n $seq ]] || ph_die "--preset and --seq are required"
+(( phases )) && stages="$stages,phases-sim,phases-real"
 [[ -z $mtp ]] && { [[ $preset == debug ]] && mtp=0 || mtp=1; }   # the preset's released MTP depth
 [[ $mtp =~ ^[0-9]+$ ]] || ph_die "--mtp takes a non-negative integer"
 [[ $tp =~ ^[1-9][0-9]*$ && $pp =~ ^[1-9][0-9]*$ && $dp =~ ^[1-9][0-9]*$ ]] || ph_die "--tp, --pp and --dp take positive integers"
@@ -52,8 +59,8 @@ done
 world=$((tp * pp * dp))
 [[ -z $expandable ]] && { [[ $preset == 0.8b-l* ]] && expandable=1 || expandable=0; }
 has() { [[ ",$stages," == *",$1,"* ]]; }
-for s in ${stages//,/ }; do [[ $s =~ ^(discovery|profile|replay|real)$ ]] || ph_die "unknown stage $s"; done
-if has discovery || has replay; then [[ -f $base_db/compute.csv ]] || ph_die "--base-db with compute.csv required"; fi
+for s in ${stages//,/ }; do [[ $s =~ ^(discovery|profile|replay|real|phases-sim|phases-real)$ ]] || ph_die "unknown stage $s"; done
+if has discovery || has replay || { has phases-sim && ! has profile; }; then [[ -f $base_db/compute.csv ]] || ph_die "--base-db with compute.csv required"; fi
 if has profile && ! has discovery; then ph_die "profile needs discovery in the same run"; fi
 
 # ---- the code must be a clean, pushed commit ----
@@ -89,13 +96,13 @@ ph_log "run $run: $preset seq $seq, tp $tp pp $pp dp $dp${stage_layers:+ split $
 scratch=$(mktemp -d "$PH_SCRATCH/ph-run-XXXXXX")
 trap 'rm -rf -- "$scratch"' EXIT
 
-simulate() {  # <perf-db> <stage> <log-level>
+simulate() {  # <perf-db> <stage> <log-level> [phases]
     local out="$scratch/$2" rc=0; mkdir -p "$out"
     timeout -k 20 2400 python3 "$g/simulate.py" --tests "$src/tests" --image "$PH_SIF" --native-dist "$dist" \
         --torch-prefix "$torch_dir/torch-deps" --causal-prefix "$PH_ENV/causal-deps" --upgraded-prefix "$PH_ENV/upgraded-deps" \
         --perf-db "$1" --calibrated-netconfig "$g/netconfig.toml" --output-dir "$out" \
         --preset "$preset" --sequence-length "$seq" --micro-batch-size "$mb" --gradient-accumulation "$ga" \
-        --tensor-parallel-size "$tp" --pipeline-parallel-size "$pp" --data-parallel-size "$dp" ${stage_layers:+--pipeline-stage-layers "$stage_layers"} --iterations "$iters" --vram-mib "$vram" --sim-log-level "$3" --mtp-layers "$mtp" \
+        --tensor-parallel-size "$tp" --pipeline-parallel-size "$pp" --data-parallel-size "$dp" ${stage_layers:+--pipeline-stage-layers "$stage_layers"} --iterations "$iters" --vram-mib "$vram" --sim-log-level "$3" --mtp-layers "$mtp" ${4:+--phase-timings} \
         > "$run/$2.log" 2>&1 || rc=$?
     local o; o=$(ls -d "$out"/discover-* 2>/dev/null | head -1)
     mkdir -p "$run/$2"
@@ -105,6 +112,7 @@ simulate() {  # <perf-db> <stage> <log-level>
         [[ $3 == debug ]] && python3 "$g/events_agg.py" "$o/simulator.log" "$run/$2/events.jsonl.gz" > "$run/$2/events_agg.log" 2>&1
     fi
     echo "$rc" > "$run/$2/exit"
+    [[ -n ${4:-} ]] && python3 "$g/phases.py" --ranks "$world" "$run/$2/worker.log" > "$run/$2/phases.json"
     ph_log "$2 exit $rc: $(python3 "$g/metrics.py" --ranks "$world" "$run/$2/worker.log") ms; missing compute keys $([[ -f $run/$2/perfdb.missing/compute.csv ]] && echo $(($(wc -l < "$run/$2/perfdb.missing/compute.csv") - 1)) || echo 0)"
     rm -rf -- "$out"
 }
@@ -151,27 +159,37 @@ if has replay; then
     simulate "$db" replay "$sim_log"
 fi
 
-if has real; then
-    r="$run/real"; mkdir -p "$r" "$scratch/rcache"
+real_pass() {  # <stage dir: real | phases-real> [phases]
+    local r="$run/$1" rc=0; mkdir -p "$r" "$scratch/rcache"
     idx=$(seq -s, 0 $((world - 1)))
     (( $(nvidia-smi --query-gpu=uuid --format=csv,noheader | wc -l) >= world )) || ph_die "real needs $world GPUs"
-    ph_log "real: waiting for GPUs $idx"
+    ph_log "$1: waiting for GPUs $idx"
     ph_wait_idle "$idx" || ph_die "GPUs not idle after waiting"
     gpus=$(nvidia-smi --query-gpu=uuid --format=csv,noheader | head -"$world" | paste -sd, -)
     ( while sleep 2; do nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | paste -sd, -; done > "$r/mem.csv" ) &
     mon=$!
-    rc=0
     APPTAINERENV_CUDA_VISIBLE_DEVICES="$gpus" APPTAINERENV_QH_TORCH_REVISION="$torch_rev" APPTAINERENV_QH_TP=$tp \
     APPTAINERENV_QH_PRESET=$preset APPTAINERENV_QH_SEQ=$seq APPTAINERENV_QH_MB=$mb APPTAINERENV_QH_GBS=$((mb * ga * dp)) \
     APPTAINERENV_QH_ITERS=$iters APPTAINERENV_QH_EXPANDABLE=$expandable APPTAINERENV_QH_MTP=$mtp \
     APPTAINERENV_QH_PP=$pp APPTAINERENV_QH_DP=$dp APPTAINERENV_QH_STAGE_LAYERS="$stage_layers" \
+    APPTAINERENV_QH_REAL_DIR="$1" APPTAINERENV_QH_PHASES="${2:-}" \
         timeout -k 25 3600 apptainer exec --containall --cleanenv --nv \
         --bind "$binds_common,$scratch/rcache:/qh-cache" --pwd /qh-run "$PH_SIF" bash "/qh-src/tests/docker/megatron/gpu01/real_inside.sh" \
         > "$r/trainer.log" 2>&1 || rc=$?
     kill "$mon" 2>/dev/null || true
     echo "$rc" > "$r/exit"
-    ph_log "real exit $rc: $(python3 "$g/metrics.py" --ranks "$world" "$r"/ranks/*/*/*/stdout.log) ms; peak $(sort -t, -k1 -n "$r/mem.csv" | tail -1) MiB"
+    [[ -n ${2:-} ]] && python3 "$g/phases.py" --ranks "$world" "$r"/ranks/*/*/*/stdout.log > "$r/phases.json"
+    ph_log "$1 exit $rc: $(python3 "$g/metrics.py" --ranks "$world" "$r"/ranks/*/*/*/stdout.log) ms; peak $(sort -t, -k1 -n "$r/mem.csv" | tail -1) MiB"
+}
+
+if has real; then real_pass real; fi
+
+if has phases-sim; then
+    db="$base_db"; [[ -d $run/db ]] && db="$run/db"
+    simulate "$db" phases-sim info phases
 fi
+
+if has phases-real; then real_pass phases-real phases; fi
 
 python3 - "$run" "$g/metrics.py" "$world" <<'P'
 import json, subprocess, sys
@@ -197,6 +215,10 @@ if (run / "profile" / "merge.json").exists():
 if (run / "real").exists():
     s["real"] = dict(exit=(run / "real" / "exit").read_text().strip(),
                      step_ms=ms(sorted((run / "real").glob("ranks/*/*/*/stdout.log"))))
+for stage in ("phases-sim", "phases-real"):
+    f = run / stage / "phases.json"
+    if f.exists():
+        s[stage] = dict(exit=(run / stage / "exit").read_text().strip(), **json.loads(f.read_text() or "{}"))
 if (s.get("real") or {}).get("step_ms") and (s.get("replay") or {}).get("step_ms"):
     s["replay_vs_real_pct"] = round(100 * (s["replay"]["step_ms"] - s["real"]["step_ms"]) / s["real"]["step_ms"], 2)
 (run / "summary.json").write_text(json.dumps(s, indent=1) + "\n")

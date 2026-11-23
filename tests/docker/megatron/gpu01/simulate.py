@@ -41,6 +41,8 @@ parser.add_argument("--mtp-layers", type=int, default=0, help="trained MTP layer
 parser.add_argument("--vram-mib", type=int, default=97887)
 parser.add_argument("--sim-log-level", default="info", help="simulator log level; debug enables per-event aggregation")
 parser.add_argument("--timeout-s", type=int, default=1500)
+parser.add_argument("--phase-timings", action="store_true",
+                    help="run test_megatron.py with --phase_timings (Megatron phase timers; a separate pass)")
 parser.add_argument("--dry-run", action="store_true")
 args = parser.parse_args()
 
@@ -140,6 +142,7 @@ def prepare(output, shared):
                         "--gradient_accumulation", str(args.gradient_accumulation),
                         "--iterations", str(ITERATIONS),
                         *(["--mtp-layers", str(args.mtp_layers)] if args.mtp_layers else []),
+                        *(["--phase_timings"] if args.phase_timings else []),
                         *(["--pipeline_stage_layers", args.pipeline_stage_layers] if args.pipeline_stage_layers else [])], runner_env),
     )
     write_json(output / "commands.json", commands)

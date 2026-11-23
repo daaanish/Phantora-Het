@@ -54,6 +54,14 @@ tests/docker/megatron/gpu01/run.sh <name> --preset 0.8b --seq 8192 --base-db <db
   stages alike. Default (since 2026-11-22; MTP is part of the target): the preset's own
   depth, 1 for `0.8b`, `0.8b-l4` and `9b` as in the released checkpoints, 0 for `debug`. `--mtp 0` turns it off. Every run before 2026-11-22 except
   QH-07w used 0, so to reproduce those pass `--mtp 0`.
+- `--phases`: after the chosen stages, run two extra passes with Megatron's phase timers
+  (`test_megatron.py --phase_timings`, the same timers as vanilla's Llama/GPT phase study):
+  `phases-sim` (a replay with the run's `db/`) and `phases-real` (a second real run). The
+  timers synchronize CUDA at every start/stop and barrier at level 1, so they change overlap
+  and step time; headline numbers always come from `replay` and `real`. Each pass writes
+  `phases.json` (per rank and slowest-rank ms per step, iteration 0 excluded) and is copied
+  into `summary.json`. Timers nest: `forward-backward` contains `forward-compute`,
+  `backward-compute` and `all-grads-sync`; `optimizer-*` and `params-all-gather` follow it.
 - `--pp N` (default 1) and `--stage-layers 1,3` (uneven split, one decoder-layer count per
   stage; default Megatron's even split).
 - `--dp N` (default 1, as in every run before it was added): data-parallel replicas.
@@ -167,6 +175,7 @@ add a column or row when the method changes.
 | `real_inside.sh` | real run inside the container |
 | `merge.py` | appends new positive timings to the run's DB |
 | `metrics.py` | step time from `HYBRID_METRICS` lines |
+| `phases.py` | phase timers from `HYBRID_PHASES` lines (phase passes) |
 | `events_agg.py` | debug simulator log to per-event table |
 | `verify_torch.py` | checks the container uses the build's torch |
 | `netconfig.toml` | gpu01 network calibration (271.916 Gbit/s loopback) |
