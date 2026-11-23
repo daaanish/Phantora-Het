@@ -173,6 +173,29 @@ def build_hybrid_mtp_spec(workload, pp_rank):
     return MultiTokenPredictionBlockSubmodules(layer_specs=[layer] * workload.mtp_num_layers)
 
 
+def _mtp_output_weight_unused(model):
+    """True on a stage that owns MTP but not the input embedding, with tied embeddings."""
+    return (getattr(model, "mtp_process", False) and not model.pre_process
+            and model.post_process and model.share_embeddings_and_output_weights)
+
+
+def drop_unused_mtp_output_weight(model):
+    """Remove the output-layer weight Megatron Core 0.16 allocates but never uses with MTP + PP.
+
+    On a last pipeline stage that owns MTP, Megatron keeps a copy of the word embedding and, with
+    tied embeddings, computes the logits from it (shared_embedding_or_output_weight). The output
+    layer still allocates its own weight there (skip_weight_param_allocation only checks
+    pre_process), which never receives a gradient; DDP with overlap_grad_reduce then fails the
+    per-parameter ready-count assertion in zero_grad_buffer. PP 1 is unaffected (pre_process is
+    true on the MTP stage). Call before wrapping in DDP. Returns True if a weight was removed.
+    """
+    model = getattr(model, "module", model)
+    if not _mtp_output_weight_unused(model) or model.output_layer.weight is None:
+        return False
+    model.output_layer.weight = None
+    return True
+
+
 def finalize_hybrid_grads(model, *args, **kwargs):
     """Retain Megatron DP/QK reductions and sum shared GDN scales across TP."""
     from megatron.core import parallel_state
@@ -243,6 +266,8 @@ def validate_hybrid_structure(model, workload, pp_rank):
         return checked
     if mtp is None or len(mtp.layers) != workload.mtp_num_layers:
         raise RuntimeError("hybrid MTP layer count mismatch")
+    if _mtp_output_weight_unused(model) and model.output_layer.weight is not None:
+        raise RuntimeError("unused output-layer weight on the MTP stage; call drop_unused_mtp_output_weight")
     for depth, mtp_layer in enumerate(mtp.layers):
         shape(mtp_layer.eh_proj.weight, (dims.hidden_size // tp, 2 * dims.hidden_size), "MTP eh_proj")
         for name in ("enorm", "hnorm", "final_layernorm"):

@@ -210,8 +210,10 @@ def get_model(
     )
 
     if hybrid_config is not None:
-        from qwen_hybrid_model import validate_hybrid_structure
+        from qwen_hybrid_model import drop_unused_mtp_output_weight, validate_hybrid_structure
         import json
+        if drop_unused_mtp_output_weight(gpt_model):
+            print("HYBRID_MTP_PP removed the unused output-layer weight on the MTP stage", flush=True)
         checked = validate_hybrid_structure(gpt_model, hybrid_config,
             parallel_state.get_pipeline_model_parallel_rank())
         print("HYBRID_STRUCTURE " + json.dumps(dict(layers=checked,

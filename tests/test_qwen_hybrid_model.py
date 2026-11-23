@@ -11,7 +11,7 @@ import torch
 from qwen_hybrid_config import DEBUG_MODEL, HybridConfig, configure_hybrid_args
 from qwen_hybrid_model import (
     FlashCoreAttention, GDNOutputRMSNorm, QwenRMSNorm, build_hybrid_mtp_spec, build_hybrid_spec,
-    finalize_hybrid_grads, require_hybrid_kernels, transformer_overrides, validate_hybrid_structure,
+    drop_unused_mtp_output_weight, finalize_hybrid_grads, require_hybrid_kernels, transformer_overrides, validate_hybrid_structure,
 )
 
 
@@ -275,6 +275,23 @@ class HybridModelTests(unittest.TestCase):
             finalize_hybrid_grads([chunk], None)
         original.assert_called_once_with([chunk], None)
         reduce.assert_called_once_with(grad, op=torch.distributed.ReduceOp.SUM, group="tp")
+
+    def test_mtp_pp_drops_only_the_unused_output_weight(self):
+        def stage(pre, post, mtp, tied=True):
+            module = torch.nn.Module()
+            module.output_layer = torch.nn.Linear(4, 8, bias=False)
+            module.pre_process, module.post_process, module.mtp_process = pre, post, mtp
+            module.share_embeddings_and_output_weights = tied
+            return SimpleNamespace(module=module)
+        last = stage(pre=False, post=True, mtp=True)
+        self.assertTrue(drop_unused_mtp_output_weight(last))
+        self.assertIsNone(last.module.output_layer.weight)
+        self.assertNotIn("output_layer.weight", dict(last.module.named_parameters()))
+        self.assertFalse(drop_unused_mtp_output_weight(last))
+        for kept in (stage(pre=True, post=True, mtp=True), stage(pre=False, post=True, mtp=False),
+                     stage(pre=False, post=True, mtp=True, tied=False)):
+            self.assertFalse(drop_unused_mtp_output_weight(kept))
+            self.assertIsNotNone(kept.module.output_layer.weight)
 
     def test_transformer_flags(self):
         overrides = transformer_overrides(HybridConfig())
