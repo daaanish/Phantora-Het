@@ -11,7 +11,8 @@ for path in args:
     try:
         for line in open(path, errors="replace"):
             if "HYBRID_METRICS " in line:
-                m.append(json.loads(line.split("HYBRID_METRICS ", 1)[1]))
+                # raw_decode: with many ranks another rank's output can share the line after the JSON.
+                m.append(json.JSONDecoder().raw_decode(line.split("HYBRID_METRICS ", 1)[1])[0])
     except OSError:
         pass
 ranks = {x["rank"]: x for x in m}
