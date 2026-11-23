@@ -226,8 +226,15 @@ def build(op, payload):
     if op == "SDPABackward":
         # Approximate the internal flash-attn backward via autograd: build the
         # forward graph once, time the backward.
+        # The key is aten::_scaled_dot_product_flash_attention_backward, so build the graph
+        # on the flash backend. Grouped KV (fewer K/V heads than Q heads) needs enable_gqa:
+        # without it PyTorch falls back to the math backend, which materializes s x s scores
+        # and timed ~10x too slow (QH-07ab: 21.5 ms vs 2.0 ms real at seq 8192, 4/1 heads).
+        from torch.nn.attention import SDPBackend, sdpa_kernel
         q = alloc(P["q"], requires_grad=True); k = alloc(P["k"], requires_grad=True); v = alloc(P["v"], requires_grad=True)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=P["causal"])
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            out = F.scaled_dot_product_attention(
+                q, k, v, is_causal=P["causal"], enable_gqa=k.shape[-3] != q.shape[-3])
         g = alloc(P["grad"])
         return lambda: out.backward(g, retain_graph=True)
     return None  # unknown op
