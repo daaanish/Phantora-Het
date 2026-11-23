@@ -240,21 +240,41 @@ def build(op, payload):
     return None  # unknown op
 
 
+MARKER = "spin_kernel"  # the kernel torch.cuda._sleep launches; never part of a profiled op
+CAPTURE_LOG = []         # (iters requested, complete iterations used) per key whose capture was short
+
+
 def time_kernel(thunk, warmup, iters):
     """Kernel-only device time, mirroring Phantora's CUPTI sum: profile `iters`
-    runs and sum each kernel's self device time (excludes launch/CPU overhead)."""
+    runs and sum each kernel's device time (excludes launch/CPU overhead).
+
+    A marker kernel separates the iterations, and only complete, consistent iterations
+    between captured markers are averaged. The earlier version divided the kernels of the
+    whole capture by `iters`; in some profiling sessions the profiler recorded only 4 of 5
+    iterations, so every key came out 0.8x (A15, QH-07ad)."""
     for _ in range(warmup):
         thunk()
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        torch.cuda._sleep(1)
         for _ in range(iters):
             thunk()
+            torch.cuda._sleep(1)
         torch.cuda.synchronize()
-    us = sum(
-        getattr(e, "self_device_time_total", 0) or getattr(e, "self_cuda_time_total", 0)
-        for e in prof.key_averages()
-    )
-    return int(us * 1000 / iters)  # us total over iters -> ns per iter
+    kernels = sorted((e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA),
+                     key=lambda e: e.time_range.start)
+    marks = [i for i, e in enumerate(kernels) if MARKER in e.name]
+    spans = [kernels[a + 1:b] for a, b in zip(marks, marks[1:])]
+    if spans:   # keep iterations with the usual kernel count (a partly captured one is dropped)
+        usual = max(set(len(s) for s in spans), key=[len(s) for s in spans].count)
+        spans = [s for s in spans if len(s) == usual]
+    if len(spans) < min(3, iters):
+        raise RuntimeError(f"profiler captured {len(spans)} complete iterations of {iters}; refusing to store a timing")
+    if len(spans) != iters:
+        CAPTURE_LOG.append((iters, len(spans)))
+        print(f"warning: profiler captured {len(spans)} of {iters} iterations; averaging those", file=sys.stderr)
+    us = sum(e.time_range.elapsed_us() for s in spans for e in s) / len(spans)
+    return int(us * 1000)  # us per iteration -> ns
 
 
 def time_wall(thunk, warmup, iters):
