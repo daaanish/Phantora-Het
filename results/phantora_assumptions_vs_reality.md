@@ -104,6 +104,14 @@ optimizer `_foreach_lerp_/sqrt/div_/add_` about 9, and smaller ones. Which are
 GDN-specific and which are shared with dense Megatron models is recorded in
 `qwen35_08b_sequence_sweep/missing_compute_ledger.csv`. Evidence: QH-07r, QH-07t.
 
+Effect on data parallelism (added 2026-11-23, QH-07z-24): with 24 layers, TP 1, seq 8192, flash,
+the real optimizer phases take 47.9 ms per step at DP 1; Phantora charges 10.7 ms (22%), because
+`_foreach_lerp_/sqrt/div_/add_` and `copy_` are unmapped and the main-to-model-params copy is
+charged 0. Megatron's distributed optimizer halves this work at DP 2 (real −23.8 ms), which
+cancels the gradient reduce-scatter's cost in backward (real +23.7 ms; Phantora +19.2 ms). In
+Phantora the optimizer saving is only −4.6 ms, so it predicts DP 2 costs +14.6 ms while real
+shows −2.4 ms. Evidence: `qwen35_data_parallel/README.md`, phase timers.
+
 ### A6. Only the dtype-only form of `aten::to` matters
 
 The handler accepts `to(tensor, dtype, bool, bool)` and ignores other forms.

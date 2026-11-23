@@ -1,0 +1,9 @@
+phase,real_dp1_ms,real_dp2_ms,real_dp2_minus_dp1_ms,phantora_dp1_ms,phantora_dp2_ms,phantora_dp2_minus_dp1_ms
+forward-backward,3345.975,3369.655,23.68,2790.952,2810.189,19.237
+forward-compute,1284.359,1292.424,8.065,1063.544,1071.907,8.363
+backward-compute,2058.284,2088.711,30.427,1727.4,1738.274,10.874
+all-grads-sync,0.116,0.113,-0.003,0.0,0.0,0.0
+optimizer-inner-step,40.897,20.603,-20.294,8.458,4.993,-3.465
+optimizer-copy-to-main-grad,3.823,1.887,-1.936,2.283,1.16,-1.123
+optimizer-copy-main-to-model-params,3.194,1.638,-1.556,0.0,0.0,0.0
+step (phase pass),3406.958,3405.751,-1.207,2801.694,2816.343,14.649

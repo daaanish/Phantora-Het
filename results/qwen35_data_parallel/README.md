@@ -85,3 +85,49 @@ Everything else as above (0.8b-l4, seq 8192, MB 1, GA 8 per replica, TP 1, 4 ite
   (1,396–1,409 ms at DP 1), so DP cost at this size is inside run-to-run noise in both conditions.
   Whether the real gradient reduce-scatter is hidden behind backward compute (and Phantora charges
   it) needs a larger gradient volume, e.g. 24 layers at DP 2, or the phase timers (`--phases`).
+
+## 24 layers with phase timers (QH-07z-24, 2026-11-23)
+
+**Why:** at 4 layers the DP cost (0–13 ms) was inside run-to-run noise. 24 layers sends 6× the
+gradient data; `--phases` adds a separate simulated and real pass with Megatron's phase timers.
+
+**Conditions:** commit `3ed5a91` (same code as `d5376d2`, records only), `0.8b` preset (24 layers),
+`--mtp 0`, flash attention, seq 8192, MB 1, 8 microbatches per replica, TP 1, PP 1,
+4 iterations, no expandable segments (preset default). Base DB: the QH-07z-fresh DP 2 run's
+`db/` (every key from the A15-fixed profiler); 8 and 33 compute + 0 and 8 memcpy keys added on
+GPU 0, no short captures. Driver 620.70.06. Coverage clean (usual unmapped list + `aten::to`);
+real `HYBRID_CONFIG` shows 24 layers, DP 2 and global batch 16 on both ranks. Phase timers
+synchronize CUDA, so their passes are separate from the headline step times.
+
+| DP | GPUs | real ms | Phantora replay ms | replay vs real | real peak MiB |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1 | 3,391.234 | 2,801.694 | −17.38% | 54,110 |
+| 2 | 2 | 3,388.801 | 2,816.343 | −16.89% | 50,476 / 50,478 |
+| DP 2 − DP 1 | | −2.433 | +14.649 | | |
+
+Phase timers, slowest rank, mean of iterations 2–4 ([`phases_24l_dp.csv`](phases_24l_dp.csv)):
+
+| phase | real DP 1 | real DP 2 | real Δ | Phantora DP 1 | Phantora DP 2 | Phantora Δ |
+|---|---:|---:|---:|---:|---:|---:|
+| forward-backward | 3,345.975 | 3,369.655 | +23.7 | 2,790.952 | 2,810.189 | +19.2 |
+| of which forward-compute | 1,284.359 | 1,292.424 | +8.1 | 1,063.544 | 1,071.907 | +8.4 |
+| of which backward-compute | 2,058.284 | 2,088.711 | +30.4 | 1,727.400 | 1,738.274 | +10.9 |
+| all-grads-sync (wait after backward) | 0.116 | 0.113 | 0.0 | 0.0 | 0.0 | 0.0 |
+| optimizer inner step | 40.897 | 20.603 | −20.3 | 8.458 | 4.993 | −3.5 |
+| optimizer copy to main grad | 3.823 | 1.887 | −1.9 | 2.283 | 1.160 | −1.1 |
+| optimizer copy main to model params | 3.194 | 1.638 | −1.6 | 0.0 | 0.0 | 0.0 |
+
+**Findings.**
+- **DP communication is hidden in backward in both.** The gradient reduce-scatter overlaps
+  backward (the wait after backward is ~0.1 ms real, 0 simulated). It still slows the
+  forward-backward pass: real +23.7 ms, Phantora +19.2 ms (81% of real).
+- **Real DP cost nets to zero because the optimizer halves.** The distributed optimizer shards
+  its step across replicas: real optimizer time falls 47.9 → 24.1 ms (−23.8), cancelling the
+  +23.7 ms. Phantora charges the optimizer only 10.7 ms at DP 1 (22% of real), so halving it saves
+  only 4.6 ms and the simulated DP cost stays +14.6 ms. The cause is A5 (unmapped operations cost
+  nothing): `_foreach_lerp_`, `_foreach_sqrt`, `_foreach_div_`, `_foreach_add_` and `copy_` are
+  in every replay's unmapped list, and the main-to-model-params copy is charged 0.
+- So the 4-layer "Phantora predicts DP cost but real shows none" result is not a communication
+  error: communication is predicted within ~5 ms; the optimizer is undercharged.
+- Error vs real at 24 layers, flash, DP 1/2: −17.4% / −16.9%.
+
