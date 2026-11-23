@@ -29,6 +29,7 @@ Evidence rows are in `Phantora-Het/QWEN_HYBRID_TRACKER.md` under the IDs given.
 | A11 | Preparing input data inside the timed step is free | Test harness, original and fork | 163 ms stall at the start of every real step | Fixed in the harness (prefetch) |
 | A12 | One measured bandwidth describes all collectives | Fork's setup | All-reduce within about 50 ms of real | Acceptable at this size |
 | A13 | Simulated GPU memory behaves like real GPU memory | Original | Peak not validated (78.7 GiB simulated vs 95.6 GiB device-level at seq 16384); it did reproduce the real out-of-memory failure at 32768 | Unvalidated |
+| A14 | The flash-attention backward can be profiled through SDPA without the grouped-KV flag | Original (`tests/perfdb/bench.py`, `SDPABackward`) | Flash backward with 4 Q / 1 KV head timed via the math fallback: 21.5 ms vs 2.0 ms real per call, +1,204 ms per step at seq 8192 (replay 25% above real) | Fixed in the fork (QH-07ab): flash forced, `enable_gqa` inferred from head counts; replay rerun pending |
 
 ## Details
 
@@ -161,3 +162,37 @@ device-level real peak. One point in its favor: with the real 97,887 MiB
 limit the simulation failed at seq 32768 with the same allocation request and
 fragmentation as the real run (16 GiB requested, 64.7 GiB allocated, 23.9 GiB
 reserved). Evidence: QH-07q.
+
+### A14. Flash backward profiled without grouped KV
+
+Phantora charges the flash-attention backward at
+`aten::_scaled_dot_product_flash_attention_backward`, and its Rust estimator
+calls that op directly. The timing-database profiler (`bench.py`) instead
+rebuilds the forward with `scaled_dot_product_attention(q, k, v, is_causal)`
+and times `out.backward`. It does not pass `enable_gqa`, and the key does not
+record it. With grouped KV (Qwen3.5-0.8B per TP 2 rank: 4 query heads, 1 KV
+head) PyTorch cannot use the flash or memory-efficient kernels without the flag
+and falls back to the math backend, which materializes the s x s scores. The
+profiled key was 21.5 ms per call; the real flash backward at the same shapes
+is 2.0 ms (real autograd 2.705 ms forward+backward minus 0.688 ms forward;
+direct op call 2.08 ms). With 56 calls per step this added 1,204 ms and put the
+first flash replay at 3,307.2 ms vs 2,645.7 ms real (+25.0%).
+
+Fix in the fork: build the graph under `sdpa_kernel(FLASH_ATTENTION)` with
+`enable_gqa = k heads != q heads`. Checked on gpu01: the key times 2.09 ms
+(was 22.2 ms); an equal-heads key is unchanged (2.12 vs 2.13 ms), so earlier
+non-GQA timings stay valid. Affects any GQA model with flash attention, not only
+Qwen. Evidence: QH-07ab.
+
+Scope (checked 2026-11-22). The code is unchanged from upstream: `bench.py`
+`SDPABackward` in `Phantora-Vanilla/Phantora-main` (301d9d9) is identical. It
+is latent there: upstream's shipped `tests/perfdb/l40s/compute.csv` has four
+SDPA keys (two forward, two backward), all with equal Q and K/V head counts
+(`[2,16,1024,128]`, `[2,16,8192,16]`), so its published timings are not
+affected. It triggers for any workload that passes grouped K/V heads to SDPA
+natively (`enable_gqa=True`, fewer K/V heads than Q heads on a rank): GQA or
+MQA models such as Llama 3, Qwen and Mistral when they do not repeat K/V
+before the call. Workloads that repeat K/V to the query head count first never
+reach it. Upstream's SDPA forward key already records `gqa`; only the backward
+key and its profiler dropped it. Not specific to Qwen or to the hybrid fork;
+our flash module is simply the first workload here to use native GQA.

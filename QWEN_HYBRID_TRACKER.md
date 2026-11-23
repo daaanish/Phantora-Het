@@ -688,6 +688,19 @@ have been produced. Peak simulation memory remains unvalidated.
   selects flash, and whether both handlers match the 2.9.1 argument lists, is checked by
   the first discovery. Expected to move: attention time and memory (no s x s scores),
   host/H2D mask work. All earlier results stay as recorded and are "unfused".
+- 2026-11-22: QH-07ab first flash run (`run.sh flash-24-8192`, commit a987685, base DB
+  QH-07aa z-24-8192, 24L TP2 seq 8192 MTP). Discovery 2,064.312 ms with 17 missing keys
+  (14 known + `eh_proj` cast + the two flash keys `SDPA` gqa and `SDPABackward`): both
+  flash handlers matched torch 2.9.1 and the simulated sm_86 device accepted the forced
+  flash backend. Replay 3,307.232 ms (14 missing). Real 2,645.674 ms, peak 37,186 MiB
+  (unfused QH-07aa real 3,775.960 ms, 50,202 MiB: flash is 30% faster, 13 GiB less).
+  Replay vs real +25.0%. Per-op replay diff vs unfused: removed BMM/softmax/masked_fill/
+  baddbmm/mask memcpy etc. ~ -1,190 ms, but `SDPABackward` +1,204 ms (21.5 ms x 56 calls).
+  Cause: `tests/perfdb/bench.py` (upstream code) times SDPABackward without `enable_gqa`,
+  so the math backend ran (A14 in `results/phantora_assumptions_vs_reality.md`). Fixed
+  (flash forced, enable_gqa inferred); fixed profiler times the key 2.09 ms vs 2.0 ms real.
+  Replay with the fix pending (needs a fresh profile of the SDPA keys). Run
+  `gpu01:/home/dathar/Phantora/runs/20261122-220744-flash-24-8192-a987685e`.
 - Corrections to pasted specification: dense Qwen3.5 is an official target;
   dense Next is an adaptation; gated full attention and exact normalization matter;
   timing coverage must include surrounding ops and all rank-local/full-depth keys;
