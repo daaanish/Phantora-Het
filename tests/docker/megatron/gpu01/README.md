@@ -46,7 +46,8 @@ tests/docker/megatron/gpu01/run.sh <name> --preset 0.8b --seq 8192 --base-db <db
 ```
 
 - `<name>`: short label, e.g. `seq8192-layout`. The directory adds the date and commit.
-- `--preset`: `0.8b` (24 layers) or `0.8b-l4` (4 layers); `debug` and `9b` also exist.
+- `--preset`: `0.8b` (24 layers) or the reduced-depth `0.8b-l4`, `0.8b-l8`, `0.8b-l12`,
+  `0.8b-l16` (same shapes and 3 GDN : 1 attention pattern); `debug` and `9b` also exist.
 - `--base-db`: the timing database to start from. It is copied into the run, never changed.
 - `--stages`: any of `discovery,profile,replay,real` (default `discovery,profile,replay`).
 - `--mtp N`: train N multi-token-prediction layers; applies to the simulated and the real

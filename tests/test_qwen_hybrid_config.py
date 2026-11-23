@@ -38,6 +38,17 @@ class HybridConfigTests(unittest.TestCase):
             ("gdn", "gdn", "gdn", "full_attention"),
         )))
 
+    def test_08b_reduced_depth_presets_keep_shapes_pattern_and_mtp(self):
+        from dataclasses import replace
+        full = HYBRID_PRESETS["0.8b"]
+        for depth in (4, 8, 12, 16):
+            with self.subTest(depth=depth):
+                short = HYBRID_PRESETS[f"0.8b-l{depth}"]
+                self.assertEqual(short.num_layers, depth)
+                self.assertEqual(replace(short, name=full.name, num_layers=full.num_layers), full)
+                self.assertEqual(short.layer_types, ("gdn", "gdn", "gdn", "full_attention") * (depth // 4))
+                HybridConfig(model=short, tensor_parallel_size=2, world_size=2, mtp_num_layers=1)
+
     def test_global_pattern_and_crossing_pipeline_boundary(self):
         config = HybridConfig(model=replace(DEBUG_MODEL, num_layers=12), pipeline_parallel_size=2, world_size=2)
         self.assertEqual(config.pipeline_layers(1), (

@@ -13,12 +13,12 @@
 #   --stage-layers L  uneven PP split, decoder layers per stage, e.g. 1,3 (default: Megatron's even split)
 #   --iterations N    training iterations (default 4; step time = mean of iterations 2..N, slower rank)
 #   --mtp N           train N multi-token-prediction layers (default: the preset's own depth, 1 for
-#                     0.8b/0.8b-l4/9b, 0 for debug; --mtp 0 = off, as in every run before
+#                     0.8b*/9b, 0 for debug; --mtp 0 = off, as in every run before
 #                     2026-11-22 except QH-07w)
 #   --vram-mib M      simulated GPU memory (default 97887; seq 32768 needed 131072)
 #   --sim-log LEVEL   replay simulator log level (default debug: keeps per-event charges in events.jsonl.gz)
 #   --expandable / --no-expandable   PYTORCH_CUDA_ALLOC_CONF=expandable_segments for the real run
-#                     (default: on for 0.8b-l4, off otherwise, as in the QH-07 sweeps)
+#                     (default: on for the reduced-depth 0.8b-l* presets, off otherwise)
 #   --allow-unpushed  run even if the clone's HEAD is not on its upstream branch
 #
 # Output: $PH_RUNS/<YYYYmmdd-HHMMSS>-<name>-<commit8>/  (commit.txt, config.json, build.json,
@@ -50,7 +50,7 @@ done
 [[ -z $stage_layers || $stage_layers =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || ph_die "--stage-layers takes e.g. 1,3"
 [[ -z $stage_layers ]] || (( $(tr ',' '\n' <<< "$stage_layers" | wc -l) == pp )) || ph_die "--stage-layers needs $pp entries"
 world=$((tp * pp * dp))
-[[ -z $expandable ]] && { [[ $preset == 0.8b-l4 ]] && expandable=1 || expandable=0; }
+[[ -z $expandable ]] && { [[ $preset == 0.8b-l* ]] && expandable=1 || expandable=0; }
 has() { [[ ",$stages," == *",$1,"* ]]; }
 for s in ${stages//,/ }; do [[ $s =~ ^(discovery|profile|replay|real)$ ]] || ph_die "unknown stage $s"; done
 if has discovery || has replay; then [[ -f $base_db/compute.csv ]] || ph_die "--base-db with compute.csv required"; fi

@@ -107,11 +107,21 @@ QWEN35_08B = ModelSpec(
 # Reduced-depth timing fixture: 0.8B layer shapes, one 3 GDN + 1 full-attention group.
 # It is not a released Qwen checkpoint; use it to fit longer sequences in memory.
 QWEN35_08B_L4 = replace(QWEN35_08B, name="qwen3.5-0.8b-text-4layer", num_layers=4)
+# Intermediate depths between the 4-layer fixture and the released 24 layers (2026-11-22), same
+# shapes and 3 GDN : 1 full-attention pattern; also not released checkpoints.
+QWEN35_08B_L8 = replace(QWEN35_08B, name="qwen3.5-0.8b-text-8layer", num_layers=8)
+QWEN35_08B_L12 = replace(QWEN35_08B, name="qwen3.5-0.8b-text-12layer", num_layers=12)
+QWEN35_08B_L16 = replace(QWEN35_08B, name="qwen3.5-0.8b-text-16layer", num_layers=16)
 
-HYBRID_PRESETS = {"debug": DEBUG_MODEL, "0.8b": QWEN35_08B, "0.8b-l4": QWEN35_08B_L4, "9b": QWEN35_9B}
+HYBRID_PRESETS = {"debug": DEBUG_MODEL, "0.8b": QWEN35_08B, "0.8b-l4": QWEN35_08B_L4,
+                  "0.8b-l8": QWEN35_08B_L8, "0.8b-l12": QWEN35_08B_L12, "0.8b-l16": QWEN35_08B_L16,
+                  "9b": QWEN35_9B}
 HYBRID_CONFIG_SOURCES = {
     QWEN35_08B: QWEN35_08B_CONFIG_SOURCE,
     QWEN35_08B_L4: f"{QWEN35_08B_CONFIG_SOURCE}; depth reduced from 24 to 4 layers",
+    QWEN35_08B_L8: f"{QWEN35_08B_CONFIG_SOURCE}; depth reduced from 24 to 8 layers",
+    QWEN35_08B_L12: f"{QWEN35_08B_CONFIG_SOURCE}; depth reduced from 24 to 12 layers",
+    QWEN35_08B_L16: f"{QWEN35_08B_CONFIG_SOURCE}; depth reduced from 24 to 16 layers",
     QWEN35_9B: QWEN35_CONFIG_SOURCE,
 }
 
