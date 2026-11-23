@@ -24,6 +24,9 @@
 #   --sim-log LEVEL   replay simulator log level (default debug: keeps per-event charges in events.jsonl.gz)
 #   --expandable / --no-expandable   PYTORCH_CUDA_ALLOC_CONF=expandable_segments for the real run
 #                     (default: on for the reduced-depth 0.8b-l* presets, off otherwise)
+#   trace-real (stage): a second real run that writes torch.profiler traces of iteration 2 (CUDA only)
+#                     and iteration 3 (CPU+CUDA with shapes) per rank to trace-real/traces/, for
+#                     per-op attribution against the replay (QH-07r method). Traced steps are slower.
 #   --no-compile-cache  real runs compile into a fresh per-run cache (as before 2026-11-23) instead
 #                     of $PH_CACHE/real-compile/<torch build>/ (Triton, Inductor, CUDA JIT), which is
 #                     kept across runs. Step time excludes iteration 0, where compilation happens.
@@ -63,7 +66,7 @@ done
 world=$((tp * pp * dp))
 [[ -z $expandable ]] && { [[ $preset == 0.8b-l* ]] && expandable=1 || expandable=0; }
 has() { [[ ",$stages," == *",$1,"* ]]; }
-for s in ${stages//,/ }; do [[ $s =~ ^(discovery|profile|replay|real|phases-sim|phases-real)$ ]] || ph_die "unknown stage $s"; done
+for s in ${stages//,/ }; do [[ $s =~ ^(discovery|profile|replay|real|phases-sim|phases-real|trace-real)$ ]] || ph_die "unknown stage $s"; done
 if has discovery || has replay || { has phases-sim && ! has profile; }; then [[ -f $base_db/compute.csv ]] || ph_die "--base-db with compute.csv required"; fi
 if has profile && ! has discovery; then ph_die "profile needs discovery in the same run"; fi
 
@@ -143,12 +146,13 @@ if has profile; then
         ph_log "profile: $(($(wc -l < "$p/keys/compute.csv") - 1)) compute keys, $(($(wc -l < "$p/keys-exp/compute.csv") - 1)) exp_out keys; waiting for GPU 0"
         ph_wait_idle 0 || ph_die "GPU 0 not idle after waiting"
         gpu=$(nvidia-smi -i 0 --query-gpu=uuid --format=csv,noheader)
-        rc=0
+        rc=0; glog=$(ph_gpu_log "$p/clocks.csv")
         APPTAINERENV_CUDA_VISIBLE_DEVICES="$gpu" APPTAINERENV_QH_TORCH_REVISION="$torch_rev" \
         APPTAINERENV_QH_GPU_NAME="$PH_GPU_NAME" APPTAINERENV_QH_EXP_ITERS=$([[ $seq -gt 16384 ]] && echo 2 || echo 3) \
             timeout -k 15 2400 apptainer exec --containall --cleanenv --nv \
             --bind "$binds_common,$scratch/cache:/qh-cache" --pwd /qh-run "$PH_SIF" bash "/qh-src/tests/docker/megatron/gpu01/profile_inside.sh" \
             > "$p/profile.log" 2>&1 || rc=$?
+        kill "$glog" 2>/dev/null || true
         echo "$rc" > "$p/exit"
         ph_log "profile exit $rc"
         python3 "$g/merge.py" "$run" > "$p/merge.log" 2>&1 || ph_die "merge failed; see profile/merge.log"
@@ -164,7 +168,7 @@ if has replay; then
     simulate "$db" replay "$sim_log"
 fi
 
-real_pass() {  # <stage dir: real | phases-real> [phases]
+real_pass() {  # <stage dir: real | phases-real | trace-real> [phases | trace]
     local r="$run/$1" rc=0 cbind="" cenv="" t0=$SECONDS; mkdir -p "$r" "$scratch/rcache"
     if (( compile_cache )); then
         local cdir="$PH_CACHE/real-compile/$(basename "$torch_dir")"; mkdir -p "$cdir"
@@ -181,18 +185,18 @@ real_pass() {  # <stage dir: real | phases-real> [phases]
     ph_wait_idle "$idx" || ph_die "GPUs not idle after waiting"
     gpus=$(nvidia-smi --query-gpu=uuid --format=csv,noheader | head -"$world" | paste -sd, -)
     ( while sleep 2; do nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | paste -sd, -; done > "$r/mem.csv" ) &
-    mon=$!
+    mon=$!; local glog; glog=$(ph_gpu_log "$r/clocks.csv")
     APPTAINERENV_CUDA_VISIBLE_DEVICES="$gpus" APPTAINERENV_QH_TORCH_REVISION="$torch_rev" APPTAINERENV_QH_TP=$tp \
     APPTAINERENV_QH_PRESET=$preset APPTAINERENV_QH_SEQ=$seq APPTAINERENV_QH_MB=$mb APPTAINERENV_QH_GBS=$((mb * ga * dp)) \
     APPTAINERENV_QH_ITERS=$iters APPTAINERENV_QH_EXPANDABLE=$expandable APPTAINERENV_QH_MTP=$mtp \
     APPTAINERENV_QH_PP=$pp APPTAINERENV_QH_DP=$dp APPTAINERENV_QH_STAGE_LAYERS="$stage_layers" \
-    APPTAINERENV_QH_REAL_DIR="$1" APPTAINERENV_QH_PHASES="${2:-}" APPTAINERENV_QH_COMPILE_CACHE="$cenv" \
+    APPTAINERENV_QH_REAL_DIR="$1" APPTAINERENV_QH_PHASES="$([[ ${2:-} == phases ]] && echo 1)" APPTAINERENV_QH_TRACE="$([[ ${2:-} == trace ]] && echo 1)" APPTAINERENV_QH_COMPILE_CACHE="$cenv" \
         timeout -k 25 3600 apptainer exec --containall --cleanenv --nv \
         --bind "$binds_common,$scratch/rcache:/qh-cache$cbind" --pwd /qh-run "$PH_SIF" bash "/qh-src/tests/docker/megatron/gpu01/real_inside.sh" \
         > "$r/trainer.log" 2>&1 || rc=$?
-    kill "$mon" 2>/dev/null || true
+    kill "$mon" "$glog" 2>/dev/null || true
     echo "$rc" > "$r/exit"
-    [[ -n ${2:-} ]] && python3 "$g/phases.py" --ranks "$world" "$r"/ranks/*/*/*/stdout.log > "$r/phases.json"
+    [[ ${2:-} == phases ]] && python3 "$g/phases.py" --ranks "$world" "$r"/ranks/*/*/*/stdout.log > "$r/phases.json"
     echo $((SECONDS - t0)) > "$r/wall_s"   # whole stage incl. container start and compilation
     ph_log "$1 exit $rc ($((SECONDS - t0)) s): $(python3 "$g/metrics.py" --ranks "$world" "$r"/ranks/*/*/*/stdout.log) ms; peak $(sort -t, -k1 -n "$r/mem.csv" | tail -1) MiB"
 }
@@ -205,6 +209,8 @@ if has phases-sim; then
 fi
 
 if has phases-real; then real_pass phases-real phases; fi
+
+if has trace-real; then real_pass trace-real trace; fi
 
 python3 - "$run" "$g/metrics.py" "$world" <<'P'
 import json, subprocess, sys

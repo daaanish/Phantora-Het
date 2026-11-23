@@ -337,7 +337,10 @@ def main(
     prefetch=True,
     pipeline_stage_layers=None,
     phase_timings=False,
+    trace_dir=None,
 ):
+    if trace_dir is not None and iterations < 4:
+        raise ValueError("Tracing needs at least four iterations (iterations 2 and 3 are traced)")
     if phase_timings and iterations < 2:
         raise ValueError("Phase timings require at least two iterations (one warmup)")
     world_size = int(os.environ["WORLD_SIZE"])
@@ -518,6 +521,14 @@ def main(
                 train_iterator = [prefetch_batches(it, num_microbatches) for it in train_iterator]
             else:
                 train_iterator = prefetch_batches(train_iterator, num_microbatches)
+        profiler = None
+        if trace_dir is not None and i in (2, 3):
+            # QH-07r method: iteration 2 CUDA-only (light), iteration 3 CPU+CUDA with shapes, which maps
+            # each kernel to its outermost ATen op. Traced iterations are slower; never use as headline.
+            from torch.profiler import profile, ProfilerActivity
+            profiler = (profile(activities=[ProfilerActivity.CUDA]) if i == 2 else
+                        profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True))
+            profiler.start()
         start, start_wall = time_pair()
         for model_chunk in iter_model_chunks(model):
             model_chunk.zero_grad_buffer()
@@ -555,6 +566,13 @@ def main(
         optim.step()
         torch.cuda.synchronize()
         end, end_wall = time_pair()
+        if profiler is not None:
+            profiler.stop()
+            kind = "cuda" if i == 2 else "full"
+            os.makedirs(trace_dir, exist_ok=True)
+            profiler.export_chrome_trace(os.path.join(trace_dir, f"{kind}-rank-{rank}.json"))
+            del profiler
+            print(f"TRACE rank={rank} kind={kind} iteration={i} step_s={end - start:.6f}", flush=True)
         print(f"rank {rank} iter {i} time: {end - start:.2f} wall: {end_wall - start_wall:.2f}\n", end="")
         duras.append(end - start)
         duras_wall.append(end_wall - start_wall)
@@ -599,6 +617,8 @@ if __name__ == "__main__":
     parser.add_argument("--hybrid-preset", choices=HYBRID_PRESETS, default=None)
     parser.add_argument("--mtp-layers", type=int, default=0,
         help="Train this many multi-token-prediction layers (hybrid presets only; Qwen3.5 has 1). Default 0 = off.")
+    parser.add_argument("--trace_dir", default=None,
+        help="Write torch.profiler traces of iterations 2 (CUDA only) and 3 (CPU+CUDA, shapes) per rank; slows those steps.")
     parser.add_argument("--phase_timings", action="store_true",
         help="Megatron phase timers (excluding iteration 0); synchronizes CUDA, so run as a separate pass.")
     parser.add_argument("--global_batch_size", type=int, default=None)
@@ -703,5 +723,6 @@ if __name__ == "__main__":
         prefetch=not args.no_prefetch_batches,
         pipeline_stage_layers=args.pipeline_stage_layers,
         phase_timings=args.phase_timings,
+        trace_dir=args.trace_dir,
     )
     disable_function_tracer()

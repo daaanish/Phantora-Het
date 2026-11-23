@@ -21,4 +21,4 @@ exec torchrun --standalone --nproc-per-node="$((QH_TP * pp * dp))" --log-dir="$o
     --hybrid-preset "$QH_PRESET" --tensor_parallel_size "$QH_TP" --data_parallel_size "$dp" \
     --pipeline_model_parallel_size "$pp" --sequence_length "$QH_SEQ" --micro_batch_size "$QH_MB" \
     --global_batch_size "$QH_GBS" --iterations "$QH_ITERS" --mtp-layers "${QH_MTP:-0}" \
-    ${QH_STAGE_LAYERS:+--pipeline_stage_layers "$QH_STAGE_LAYERS"} ${QH_PHASES:+--phase_timings}
+    ${QH_STAGE_LAYERS:+--pipeline_stage_layers "$QH_STAGE_LAYERS"} ${QH_PHASES:+--phase_timings} ${QH_TRACE:+--trace_dir "$out/traces"}

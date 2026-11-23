@@ -62,6 +62,14 @@ tests/docker/megatron/gpu01/run.sh <name> --preset 0.8b --seq 8192 --base-db <db
   `phases.json` (per rank and slowest-rank ms per step, iteration 0 excluded) and is copied
   into `summary.json`. Timers nest: `forward-backward` contains `forward-compute`,
   `backward-compute` and `all-grads-sync`; `optimizer-*` and `params-all-gather` follow it.
+- Stage `trace-real`: a second real run with `torch.profiler` traces of iteration 2 (CUDA only) and
+  iteration 3 (CPU+CUDA with shapes) per rank, in `trace-real/traces/` (QH-07r method; traced
+  steps run slower). `attribute.py <run>/replay <run>/trace-real/traces out.csv` joins every real
+  kernel to its outermost ATen op and compares per op group with the replay's charged time (needs
+  `--sim-log debug`, the default, for `replay/events.jsonl.gz`).
+- GPU clocks: the profile stage and every real stage log SM/memory clock, power, temperature,
+  throttle reasons and utilization every 0.5 s to `clocks.csv`; `clocks.py clocks.csv` summarizes
+  the busy samples.
 - `--no-compile-cache`: since 2026-11-23 real runs (`real`, `phases-real`) keep Triton, Inductor
   and CUDA JIT caches in `~/Phantora/cache/real-compile/<torch build>/` across runs, so step 1
   no longer recompiles every kernel. Step time excludes iteration 0 either way. This flag gives
@@ -180,6 +188,8 @@ add a column or row when the method changes.
 | `real_inside.sh` | real run inside the container |
 | `merge.py` | appends new positive timings to the run's DB |
 | `metrics.py` | step time from `HYBRID_METRICS` lines |
+| `attribute.py` | per-op real vs charged time from a trace-real trace and a debug replay |
+| `clocks.py` | summary of a `clocks.csv` GPU clock/power log |
 | `phases.py` | phase timers from `HYBRID_PHASES` lines (phase passes) |
 | `events_agg.py` | debug simulator log to per-event table |
 | `verify_torch.py` | checks the container uses the build's torch |

@@ -14,6 +14,14 @@ PH_SCRATCH="${PH_SCRATCH:-/tmp}"              # fast local disk for build trees 
 ph_log() { printf '%s %s\n' "$(date +%F_%T)" "$*" | tee -a "${PH_LOG_FILE:-/dev/null}" >&2; }
 ph_die() { ph_log "ERROR: $*"; exit 1; }
 
+# Log GPU clocks, power, temperature, throttle reasons and utilization every 0.5 s to <file>
+# (CSV, one row per GPU per sample) until the returned PID is killed. Usage: pid=$(ph_gpu_log FILE)
+ph_gpu_log() {
+    nvidia-smi --query-gpu=timestamp,index,clocks.sm,clocks.mem,power.draw,temperature.gpu,clocks_throttle_reasons.active,utilization.gpu \
+        --format=csv,nounits -lms 500 > "$1" 2>/dev/null &
+    echo $!
+}
+
 # Wait until the given GPU indices (e.g. "0" or "0,1") have no process, <=16 MiB used and 0% utilization.
 ph_wait_idle() {
     local i
