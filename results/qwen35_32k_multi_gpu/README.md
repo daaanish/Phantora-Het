@@ -5,6 +5,20 @@ measured on one gpu01 Blackwell GPU. 24 layers at 32k do not fit on gpu01's 2 GP
 training, so the real reference is a 12-layer, TP 2 point. Data:
 [`phantora_32k_multi_gpu.csv`](phantora_32k_multi_gpu.csv) (every run, including failures).
 
+## Models
+
+All runs use Qwen3.5-0.8B text-decoder shapes: hidden 1,024, SwiGLU FFN 3,584, vocabulary 248,320
+(tied embeddings), full attention with 8 query heads / 2 KV groups (head dim 256), Gated DeltaNet
+with 16 key / 16 value heads (head dim 128). Layers follow Qwen3.5's 3:1 pattern (every fourth
+layer is full attention). With MTP 1, one extra MTP layer (gated full attention + SwiGLU) sits on
+the last pipeline stage.
+
+| preset | decoder layers | GDN + full attention | use here |
+|---|---:|---|---|
+| `0.8b` | 24 (full model) | 18 + 6 | 4- and 8-GPU predictions |
+| `0.8b-l12` | 12 (first 12 of the full model) | 9 + 3 | 2-GPU real reference |
+| `0.8b-l4` | 4 (first 4) | 3 + 1 | MTP + PP fix test |
+
 ## Conditions
 
 - gpu01, RTX PRO 6000 Blackwell Max-Q, driver 620.70.06. seq 32768, MB 1, 8 microbatches per
@@ -27,7 +41,7 @@ training, so the real reference is a 12-layer, TP 2 point. Data:
   - **C**, MTP 1 on `b8bd065`, the fix below: fix test on 2 real GPUs, and the three TP 2
     configurations from A.
 
-## Real reference (2 GPUs, 12 layers, TP 2)
+## Real reference: Qwen3.5-0.8B, first 12 layers (`0.8b-l12`, 9 GDN + 3 full attention), seq 32768, TP 2, 2 GPUs
 
 | MTP | real ms | Phantora replay ms | replay vs real | real peak MiB per GPU |
 |---:|---:|---:|---:|---:|
@@ -38,7 +52,7 @@ training, so the real reference is a 12-layer, TP 2 point. Data:
 The MTP-on anchor profiled 243 compute and 20 memcpy keys from nothing in about 2 minutes on
 GPU 0. It agrees with the A15-corrected replay of the earlier 12-layer 32k point (−7.4%).
 
-## 24 layers, seq 32768, MTP 1 (condition C, simulation only)
+## Prediction: Qwen3.5-0.8B, full 24 layers (`0.8b`, 18 GDN + 6 full attention), seq 32768, MTP 1 (condition C, simulation only)
 
 | TP × DP × PP | GPUs | Phantora replay ms | new keys on GPU 0 |
 |---|---:|---:|---|
@@ -62,7 +76,7 @@ configurations.
   because the MTP stage is also the first stage. Fixed in the harness (`b8bd065`,
   `drop_unused_mtp_output_weight`): the weight is removed before DDP, and
   `validate_hybrid_structure` checks it is gone.
-- **Fix test on real GPUs:** 4 layers, TP 1, PP 2, MTP 1, seq 8192 trained with MTP and PP on
+- **Fix test on real GPUs:** Qwen3.5-0.8B first 4 layers (`0.8b-l4`, 3 GDN + 1 full attention), TP 1, PP 2, MTP 1, seq 8192 trained with MTP and PP on
   both GPUs (`HYBRID_MTP_PP` printed once, last stage). Real 2,342.473 ms vs replay 1,996.999 ms
   (−14.75%); real peak 14,798 / 37,048 MiB. Base DB: QH-07z-fresh DP 2 `db/`, 26 keys added.
   Also 35 unit tests in the gpu01 image, including a new one for the removal.
